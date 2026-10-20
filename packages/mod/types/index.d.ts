@@ -288,6 +288,20 @@ export type JevState = {
   test: { state: 'idle' | 'testing' | 'ok' | 'fail'; message?: string }
 }
 
+/**
+ * GPT Fast for all sessions, as the router last acknowledged it (GET/PUT /api/fast).
+ * `unknown`: not read yet; `unavailable`: the router did not answer or is too old (nothing is
+ * assumed); `ready`: `value` is the router's: null inherits, true is priority, false forces standard.
+ */
+export type GptFast = {
+  status: 'unknown' | 'ready' | 'unavailable'
+  scope: 'global' | null
+  value: boolean | null
+  revision: number
+  /** A write is out: a second press is ignored until it is answered. */
+  writing: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     ripple: {
@@ -354,6 +368,8 @@ declare module 'claude-code' {
       judgeRuns: JudgeRun[]
       judgeDownNetwork: boolean
       limit: Hot | null
+      /** This session's GPT Fast: the router's last acknowledgement, never a stored wish. */
+      gptFast: GptFast
       demo: 'cold' | 'swamp' | 'hot' | 'down' | 'kept' | null
     }
   }

@@ -33,14 +33,14 @@ import type { Lang } from '../i18n'
 import type { RenderChildren, RenderNode } from 'claude-code'
 
 import type { Effort } from '../../types'
-import { AGENTS_W, CELL_PX, DEPTH, ICON_PX, INK, METER_H, METER_W, MUTE, ROW_PX, SUB, TONE, agentsArt, clockArt, gaugeArt, iconArt, meterArt, pillArt, plateArt, ringArt, ruleArt, textPx } from './art'
+import { AGENTS_W, CELL_PX, DEPTH, ICON_PX, INK, METER_H, METER_W, MUTE, ROW_PX, SUB, TONE, agentsArt, clockArt, fastArt, gaugeArt, iconArt, meterArt, pillArt, plateArt, ringArt, ruleArt, textPx } from './art'
 import type { Sea, Tone } from './art'
 import { CLOSE_CELLS, capsule, closeButton, lift, lit, pic, pill, press, ripple, rowsOf, segmented, word, wordCells } from './kit'
 import { textButton } from './parts'
 import type { Els } from './parts'
 import type { Face } from './ripple'
 import { cacheTone, chOf, clip, contextTone, displayWidth, limitTone, providerColor, textTone } from './theme'
-import type { BandActions, DashboardView, Frame } from './view'
+import type { BandActions, DashboardView, FastState, Frame } from './view'
 import { EFFORTS, compactNumber, effortIndex, effortLabel, effortName, isRich, limitName, minutesLeft, modelName, resetsLabel, seconds } from './view'
 
 /** Growing ripples: low → max. */
@@ -284,6 +284,16 @@ function routeFact(frame: Frame, view: DashboardView, room: number, onPress: () 
 
 // ---- Controls ----------------------------------------------------------------------------------
 
+/** GPT Fast's word: the state itself, localized (Auto, ON, OFF, or unavailable when the router cannot say). */
+function fastLabel(lang: Lang, state: FastState): string {
+  return t(lang, 'fast.' + state)
+}
+
+/** What pointing at (or reading) the control says: the state, what it covers and costs, how to change it. */
+function fastTip(lang: Lang, state: FastState, busy: boolean): string {
+  return fastLabel(lang, state) + (busy ? ' (' + t(lang, 'fast.saving') + ')' : '') + ' · ' + (state === 'unavailable' ? t(lang, 'fast.downTip') : t(lang, 'fast.scope') + ' ' + t(lang, 'fast.hint'))
+}
+
 /**
  * A control: its label, the hotkey, and whether it is on (a toggle that is on, an open pane, the
  * advised Handoff). The terminal says it in the label (● / ○), as its plain Buttons take no colour.
@@ -302,6 +312,8 @@ function controls(frame: Frame, view: DashboardView, actions: BandActions): Cont
   out.push(
     { key: 'auto', label: t(L, 'band.auto') + mark(view.auto), hotkey: 'a', onPress: actions.toggleAuto, on: view.auto },
     { key: 'warm', label: t(L, 'band.warm') + mark(view.warm.on), hotkey: 'w', onPress: actions.toggleWarm, on: view.warm.on },
+    // GPT Fast: only a view that carries it draws it (the word is the state, so an unknown one reads unavailable).
+    ...(view.fast && actions.toggleFast ? [{ key: 'fast', label: '⚡ ' + fastLabel(L, view.fast.state) + (view.fast.state === 'on' ? ' ●' : view.fast.state === 'off' ? ' ○' : ''), hotkey: 'f', onPress: actions.toggleFast, on: view.fast.state === 'on' }] : []),
     // The desktop opens the log from the route itself (its value is that button), so it has no Log of its own.
     ...(!isRich(frame) ? [{ key: 'log', label: t(L, 'band.log') + mark(view.logOpen), hotkey: 'l', onPress: actions.toggleLog, on: view.logOpen }] : []),
     // The count has a slot of its own (desktop) or is always a number (terminal): no width change.
@@ -371,7 +383,7 @@ const RULE_CELLS = 1
 /** The room the route is counted at (a model name and its hit); it takes more when the row has it. */
 const ROUTE_ROOM = 14
 /** The controls whose words go first when the band is narrow, in that order; Auto's goes last. */
-const WORDLESS = ['clear', 'compact', 'settings', 'agents', 'warm'] as const
+const WORDLESS = ['clear', 'compact', 'settings', 'agents', 'warm', 'fast'] as const
 /** The capsule's own air, in cells across and rows down. */
 const PAD_X = 1
 const PAD_Y = 0.5
@@ -613,6 +625,10 @@ function controlsDrawn(el: Els, frame: Frame, view: DashboardView, actions: Band
   out.push({ key: 'auto', cells: wordCells(autoLabel), node: word(el, 'auto', view.auto, autoLabel, actions.toggleAuto, view.effort.mode === 'deciding', tipScope('auto')), tip: autoTip })
   const warmLabel = t(L, 'band.warm')
   out.push(iconControl(el, 'warm', iconArt('flame', view.warm.on, 'amber'), ICON_PX, warmLabel, t(L, 'band.warmAlt', { state: state(view.warm.on) }) + ' · ' + t(L, view.warm.here ? 'band.warmHere' : 'settings.warmLine'), actions.toggleWarm, words.includes('warm') ? warmLabel : undefined, view.warm.on ? TONE.amber.text : SUB))
+  if (view.fast && actions.toggleFast) {
+    const fastText = fastLabel(L, view.fast.state)
+    out.push(iconControl(el, 'fast', fastArt(view.fast.state), ICON_PX, fastText, fastTip(L, view.fast.state, view.fast.busy), actions.toggleFast, words.includes('fast') ? fastText : undefined, view.fast.state === 'on' ? TONE.amber.text : view.fast.state === 'unavailable' ? MUTE : SUB))
+  }
   const agentsLabel = t(L, 'band.agents')
   const live = view.agents.live
   // The live count sits on the icon's shoulder, in one picture of one width: no width change.
@@ -828,7 +844,7 @@ export function renderBand(el: Els, frame: Frame, view: DashboardView, actions: 
 
 // ---- Minimal: the footer -----------------------------------------------------------------------
 
-export type FooterActions = Pick<BandActions, 'toggleAuto' | 'openSettings'>
+export type FooterActions = Pick<BandActions, 'toggleAuto' | 'openSettings'> & Partial<Pick<BandActions, 'toggleFast'>>
 
 /**
  * The minimal layout: one quiet line in the footer's mode area (SessionMode), the engine's own
@@ -857,6 +873,7 @@ export function renderFooter(el: Els, frame: Frame, view: DashboardView, actions
       {view.cache && !view.hide.includes('timer') ? <Text dimColor>{'⧗ ' + minutesLeft(left, frame.lang) + (view.warm.on ? ' ≈' : '')}</Text> : null}
       {view.limit && view.extras.includes('limits') ? <Text dimColor>{limitName(view.limit.kind, frame.lang) + ' ' + Math.round(view.limit.percent) + '%'}</Text> : null}
       {textButton(el, 'auto', t(frame.lang, 'band.auto') + (view.auto ? ' ●' : ' ○'), actions.toggleAuto)}
+      {view.fast && actions.toggleFast ? textButton(el, 'fast', '⚡ ' + fastLabel(frame.lang, view.fast.state) + (view.fast.state === 'on' ? ' ●' : view.fast.state === 'off' ? ' ○' : ''), actions.toggleFast) : null}
       {textButton(el, 'settings', '⚙', actions.openSettings)}
       {engine ?? null}
     </Box>

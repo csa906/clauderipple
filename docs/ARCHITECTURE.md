@@ -772,10 +772,16 @@ text is added. Source: `requestlog.ts`, `proxy.ts`, provider adapter outcomes.
 - `upstreamRequestId`: the final forwarded native Anthropic response's `request-id` header (passthrough or account pool).
 - `messageId`: the Anthropic message id delivered by a translated adapter or forwarded compatible response; not a generated id from a non-streaming error.
 - `upstreamCalled`: `false` only for a known pre-model-API exit; omitted when a search backend was attempted or the call state is unknown.
-- `refusal`: `thread-continue`, `drain`, `unroutable`, `no-account`, `unknown-provider` or `web-search-unsupported`, from the actual exit branch.
+- `refusal`: `thread-continue`, `drain`, `unroutable`, `no-account`, `unknown-provider`, `web-search-unsupported` or `prompt-incompatible`, from the actual exit branch. `prompt-incompatible` follows an upstream request; it does not set `upstreamCalled: false`.
 - `purpose`: `auto-mode-classifier` from the security-monitor request shape regardless of routing settings, or `web-search` for router-served searches.
-- `requestedTier`: the service tier actually sent upstream, including ChatGPT's `speed: "fast"` → `priority`; omitted when no tier was sent.
-- `servedTier`: the response-reported tier (Responses/Chat `service_tier` or Anthropic `usage.service_tier`); never inferred from the request.
+- `requestedTier`: the service tier actually sent upstream, including ChatGPT's `speed: "fast"` → `priority`; omitted when no tier was sent. A ChatGPT provider may set `defaultServiceTier: "priority"` to request Fast even when the host omits `speed`, or `"default"` for ordinary service. An explicit `speed: "fast"` still requests priority. Removing the setting restores host-controlled behavior. Priority can consume the subscription allowance faster; it does not lower reasoning effort.
+- `servedTier`: the response-reported tier (Responses/Chat `service_tier` or Anthropic `usage.service_tier`); never inferred from the request. For ChatGPT-authenticated Codex, this is raw response metadata, not authoritative end-to-end Fast confirmation: `default` does not prove that Fast was ignored or downgraded ([OpenAI contributor explanation](https://github.com/openai/codex/issues/14204#issuecomment-4033184620)). Keep it separate from `requestedTier` and do not infer actual processing speed from either field.
+
+**Native GPT Fast toggle (local extension).** `cli.gptFastModels` is an explicit list of configured ChatGPT model IDs whose upstream Fast support has been verified. Install and GUI config saves synchronize exact `CLAUDE_CODE_MODEL_CAPABILITIES` clauses (including `@effort` variants and consistent configured route aliases), plus the documented `CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1` gateway startup option. Existing manual capability clauses retain precedence. No global `fastMode` preference is written: Desktop continues to own the session's ON/OFF flag, which the native CLI sends as `speed: "fast"` only when enabled. Remove `defaultServiceTier: "priority"` when opting in; validation rejects that conflicting default.
+
+The availability option is process-wide, not a GPT-only entitlement override. It must be present before the new CLI process performs its availability check. Existing server-origin denials, managed settings and real upstream permissions are not erased or fabricated. Native Claude model switches remain subject to their upstream requirements, and must not be described as unaffected client-side availability. Desktop/CLI installation files are not patched. A fresh Desktop Code session is required for activation verification.
+
+Ownership is kept next to the selected user settings file in `settings.json.clauderipple-native-fast.json`. Disabling the whitelist (empty/absent) or uninstalling restores only owned values, preserving manual values and additions; conflicting external edits are refused rather than overwritten. A pending sidecar journal makes an interrupted settings write recoverable. `CLAUDE_SETTINGS_PATH` is honored for both the settings and sidecar. This option advertises support and controls the requested tier; the ChatGPT response-tier caveat above still applies.
 
 - **Server-side threads ("tether").** The first request of a session carries
   `thread: {type:"create"}` and the full history; later turns carry
@@ -1225,10 +1231,10 @@ Cloud Code Assist (CCA) backend, with several accounts rotating. Same translatio
 Studio; only `transport.ts` differs. Accounts live in `<home>/google-accounts.json` (0600,
 cross-process lock, atomic write, one account per email+project, a re-login replaces its own
 entry), the sign-in in `login.ts`, the account pool and refresh in `accounts.ts`, and the wire
-facts and model-id resolution in `antigravity.ts`. **Every wire fact below is taken from the
-reference implementation opencodex (GitHub `lidge-jun/opencodex`, read 2026-10-01 as a
-behavioral spec — no code copied; project rule) and is not measured live** — no Antigravity
-subscription exists in this environment. Files are under `src/`:
+facts and model-id resolution in `antigravity.ts`. **Except for the dated live observation
+below, these wire facts come from the reference implementation opencodex** (GitHub
+`lidge-jun/opencodex`, read 2026-10-01 as a behavioral spec — no code copied; project rule).
+They were not live-tested during the original implementation. Files are under `src/`:
 
 - OAuth is Google's standard installed-app flow with PKCE S256. Client id
   `1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com`, secret
@@ -1291,6 +1297,22 @@ subscription exists in this environment. Files are under `src/`:
   and is not retried. Refresh is per account, single-flight per token generation, five minutes
   ahead; only a structured `invalid_grant` marks an account for sign-in. Only the access token
   and the account email/project id are ever in memory; no token reaches a log or an API response.
+- **SDK prompt refusal (measured 2026-10-16, Windows, Claude Code 2.1.289).** On Gemini 3.8 Flash
+  and Antigravity Claude Opus 5.5, otherwise identical requests returned HTTP 429 with the
+  standalone system paragraph `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
+  and HTTP 200 without it. The paragraph alone reproduced the refusal; reducing output tokens
+  did not. OAuth, project discovery and short compatible requests succeeded on the same account.
+  This establishes a request-specific refusal, not Google's internal policy or every account's
+  quota. Related independent reports: [OpenCodex #2899](https://github.com/lidge-jun/opencodex/issues/2899),
+  [Magpie #666](https://github.com/yetone/magpie/issues/666).
+  `prompt-refusal.ts` recognizes only an HTTP 429 with that paragraph in the **outbound** system,
+  the exact generic `RESOURCE_EXHAUSTED` JSON observed, and no retry header or nonempty error
+  details. Explicit quota/reset details and all other errors retain their existing handling.
+  The adapter leaves the prompt intact, returns `400 invalid_request_error` with an explanation,
+  records `refusal: prompt-incompatible` and the upstream 429 in the note, and neither cools the
+  account nor tries the same prompt on its peers. Another compatible request can use it immediately.
+  This is error handling, not a workaround that makes Google accept the SDK prompt. HTTP-200
+  error frames were not part of this live reproduction and retain the existing stream handling.
 - Session id and prompt cache. The real client puts a stable per-conversation id at
   `request.sessionId` so provider-side replay can associate a signature with the call that made
   it; instability loses it (`google-antigravity-wire.ts:62-88`). We derive it from the router's

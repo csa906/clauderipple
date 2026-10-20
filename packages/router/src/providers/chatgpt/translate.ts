@@ -70,7 +70,7 @@ export type ResponsesRequest = {
   stream: true;
   prompt_cache_key: string;
   /** Fast mode. "priority" is the wire value the Codex CLI sends for it (codex-rs `ServiceTier::Fast`). */
-  service_tier?: "priority";
+  service_tier?: "priority" | "default";
   /** Who this turn belongs to, in the shape the Codex CLI sends — see `conversationId`. */
   client_metadata: { session_id: string; thread_id: string; turn_id: string; "x-codex-window-id": string };
 };
@@ -78,6 +78,10 @@ export type ResponsesRequest = {
 export type TranslateOptions = {
   model: string;
   effort: string;
+  /** The provider's default tier, used when neither the request nor the bar's Fast setting names one. */
+  defaultServiceTier?: "default" | "priority";
+  /** The bar's global Fast setting: true forces priority, false forces ordinary service, null/absent keeps legacy behavior. */
+  fastOverride?: boolean | null;
   identity: boolean;
   instructionsAppend?: string;
   /**
@@ -444,7 +448,11 @@ export function toResponsesRequest(req: AnthropicRequest, opts: TranslateOptions
   if (tool_choice) out.tool_choice = tool_choice;
   // Claude Code's `/fast` arrives as `speed: "fast"` (Anthropic fast mode). The ChatGPT backend's
   // equivalent is the Codex CLI's Fast mode, which bills the plan at a higher rate (Codex docs, Speed).
-  if (req.speed === "fast") out.service_tier = "priority";
+  // A provider default also works when the host does not send speed for a routed GPT model.
+  // The bar's explicit OFF wins over native Fast and provider defaults. Null keeps legacy behavior.
+  const serviceTier = opts.fastOverride === true ? "priority" : opts.fastOverride === false ? undefined
+    : req.speed === "fast" ? "priority" : opts.defaultServiceTier;
+  if (serviceTier === "priority" || serviceTier === "default") out.service_tier = serviceTier;
   return out;
 }
 

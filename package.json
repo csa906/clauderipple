@@ -19,6 +19,7 @@
     "relay:dev": "npm run relay:build && wrangler dev -c packages/remote/relay/wrangler.toml --ip 127.0.0.1 --port 8798",
     "relay:deploy": "npm run relay:build && wrangler deploy -c packages/remote/relay/wrangler.toml",
     "test": "node --test packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts",
+    "test:custom": "node scripts/test-custom.mjs",
     "cli": "node packages/cli/src/index.ts",
     "prepack": "node scripts/build-npm.mjs",
     "build": "node scripts/build-npm.mjs"

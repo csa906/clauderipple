@@ -15,6 +15,7 @@ import { ConfigStore, DEFAULTS, homeDir, configPath } from "../../router/src/con
 import { adminPort } from "../../router/src/admin.ts";
 import { certsExist, certPaths, generateCerts } from "./certs.ts";
 import { applyProxyEnv, checkProxyEnv, currentProxyEnv, removeProxyEnv, settingsPath } from "./settings.ts";
+import { gptFastModelsForConfig } from "./native-fast-mode.ts";
 import { agentDefinitionPath, agentState, installAgent, isLinux, isSupported, isWindows, removeAgent, restartAgent, startAgent, stopAgent, supervisorName } from "./supervisor.ts";
 import { BUNDLE_ID, removeBundle, writeBundle } from "./bundle.ts";
 import { applyAppProxy, caTrusted, currentAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
@@ -201,6 +202,7 @@ async function install(): Promise<void> {
   } else console.log(`✓ config kept: ${configPath()}`);
 
   const cfg = new ConfigStore(configPath()).get();
+  const gptFastModels = gptFastModelsForConfig(cfg);
   const proxyUrl = proxyUrlFor(cfg.listen.port);
   const caPath = certPaths(home).caPem;
   const maxCtx = opt("max-context-tokens");
@@ -271,7 +273,7 @@ async function install(): Promise<void> {
     console.log(`${settingsPath()} was left as it was, so Claude Code does not depend on a router that is not answering. Fix the router, then run install again.`);
     return;
   }
-  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...(maxCtx ? { maxContextTokens: Number(maxCtx) } : {}), models: cfg.cli.models ?? {} });
+  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...(maxCtx ? { maxContextTokens: Number(maxCtx) } : {}), models: cfg.cli.models ?? {}, gptFastModels });
   console.log(edit.changed ? `✓ ${settingsPath()} updated (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} already correct`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
   console.log("\nDone. New Claude Desktop Code sessions go through ClaudeRipple. Existing sessions pick up settings.json env changes on their next request.");

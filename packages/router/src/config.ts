@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import type { CompatibleCaps } from "./compat.ts";
 import { PRESETS } from "./presets.ts";
+import { gptFastModelsForConfig } from "../../cli/src/native-fast-mode.ts";
 
 export type ProviderModel = {
   id: string;
@@ -100,6 +101,8 @@ export type ChatGptProvider = {
   debugDump?: boolean | "all";
   /** Reasoning effort when the request carries none. Default "high". */
   defaultEffort?: string;
+  /** Service tier sent when the request names none ("priority" is the Codex CLI's Fast mode). The bar's global Fast setting overrides it. */
+  defaultServiceTier?: "default" | "priority";
   /** Models offered in the GUI (the Codex backend has no listing endpoint). */
   models?: ProviderModel[];
 };
@@ -343,6 +346,11 @@ export type Config = {
      * request (agents.ts). Such a worker cannot drive a browser or a simulator. Default false.
      */
     limitWorkerTools?: boolean;
+    /**
+     * Exact ids of routed ChatGPT models whose upstream Fast support was verified. Each (and its
+     * `@effort` variants) is declared fast-capable to Claude Code at startup. Default none.
+     */
+    gptFastModels?: string[];
     /**
      * Which model fills each of Claude Code's own slots, written into `~/.claude/settings.json`
      * env. Claude Code decides these before a request exists, so the router cannot reach them by
@@ -646,6 +654,8 @@ export function validate(c: Config): string[] {
         }
       }
     } else if (p.type === "chatgpt") {
+      if (p.defaultServiceTier !== undefined && p.defaultServiceTier !== "default" && p.defaultServiceTier !== "priority")
+        errors.push(`provider ${name}: defaultServiceTier must be "default" or "priority"`);
       if (p.models !== undefined && !validModels(p.models)) {
         errors.push(`provider ${name}: ${MODELS_SHAPE}`);
       }
@@ -706,6 +716,13 @@ export function validate(c: Config): string[] {
   if (!(c.listen.port > 0 && c.listen.port < 65536)) errors.push("listen.port out of range");
   if (c.cli.agentFiles !== undefined && typeof c.cli.agentFiles !== "boolean") errors.push("cli.agentFiles must be true or false");
   if (c.cli.limitWorkerTools !== undefined && typeof c.cli.limitWorkerTools !== "boolean") errors.push("cli.limitWorkerTools must be true or false");
+  if (c.cli.gptFastModels !== undefined) {
+    try {
+      gptFastModelsForConfig(c);
+    } catch (error) {
+      errors.push((error as Error).message);
+    }
+  }
   if (c.listen.openaiPort !== undefined && !(c.listen.openaiPort >= 0 && c.listen.openaiPort < 65536)) errors.push("listen.openaiPort out of range");
   return errors;
 }

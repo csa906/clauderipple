@@ -2585,6 +2585,99 @@ function modCard(id, title, blurb, sections) {
     ...sections.filter(Boolean),
   ]);
 }
+// ---- GPT Fast (one global value shared by every session and the Ripple bar)
+
+let modFast = { value: null, revision: -1, status: "unavailable", writing: false, error: "" };
+let modFastEpoch = 0;
+let modFastReading = null;
+
+function modFastReply(body) {
+  if (!body || body.scope !== "global" || (body.fast !== null && typeof body.fast !== "boolean") || !Number.isSafeInteger(body.revision) || body.revision < 0) throw new Error(t("mod.fast.invalidReply"));
+  return body;
+}
+function modFastAccept(body) {
+  if (body.revision < modFast.revision) return;
+  modFast = { ...modFast, value: body.fast, revision: body.revision, status: "ready", error: "" };
+}
+async function modFastRead() {
+  if (modFastReading || modFast.writing) return;
+  const epoch = modFastEpoch, token = {};
+  modFastReading = token;
+  try {
+    const body = modFastReply(await api("/api/fast", { cache: "no-store", signal: AbortSignal.timeout(5000) }));
+    if (epoch === modFastEpoch) modFastAccept(body);
+  } catch (error) {
+    if (epoch === modFastEpoch) modFast = { ...modFast, status: "unavailable", error: `${t("common.loadFailed")} ${error.message}` };
+  } finally {
+    if (modFastReading === token) modFastReading = null;
+    if (epoch === modFastEpoch) modFastRenderState();
+  }
+}
+async function modFastWrite(target) {
+  if (modFast.writing || modFast.status !== "ready" || (target !== null && typeof target !== "boolean")) return;
+  const epoch = ++modFastEpoch;
+  const focused = document.activeElement;
+  const focusKey = $("#mod-fast-control")?.contains(focused) ? focused.dataset.key : null;
+  // A read started before this write cannot acknowledge (or fail) the new value.
+  modFastReading = null;
+  modFast = { ...modFast, writing: true, error: "" };
+  modFastRenderState();
+  try {
+    const body = modFastReply(await api("/api/fast", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ fast: target }), signal: AbortSignal.timeout(5000) }));
+    if (body.fast !== target || body.revision < modFast.revision) throw new Error(t("mod.fast.invalidReply"));
+    if (epoch === modFastEpoch) modFastAccept(body);
+  } catch (error) {
+    // A timeout may have happened after persistence; keep the last acknowledgement, but mark it unknown until read back.
+    if (epoch === modFastEpoch) modFast = { ...modFast, status: "unavailable", error: `${t("common.saveFailed")} ${error.message}` };
+  } finally {
+    if (epoch === modFastEpoch) {
+      modFast = { ...modFast, writing: false };
+      modFastRenderState();
+      // Disabling a replaced button drops focus to body. Restore it after saving, but never steal
+      // focus if the user moved elsewhere while the request was pending.
+      if (focusKey && (!document.activeElement || document.activeElement === document.body)) {
+        const root = $("#mod-fast-control");
+        const button = root.querySelector(`[data-key="${CSS.escape(focusKey)}"]`);
+        if (button && !button.disabled) button.focus();
+        else root.focus(); // a failed save leaves every button disabled; keep keyboard users inside the card
+      }
+    }
+  }
+}
+function modFastRenderState() {
+  const root = $("#mod-fast-control");
+  if (!root) return;
+  const known = modFast.status === "ready";
+  const selected = known ? String(modFast.value) : "unavailable";
+  const label = t("mod.fast.title");
+  const controlState = `${selected}:${modFast.writing}`;
+  if (root.dataset.state !== controlState) {
+    root.dataset.state = controlState;
+    modRedraw(root, [modSegmented("session-fast", [
+      { value: "null", label: "Auto" }, { value: "true", label: "ON" }, { value: "false", label: "OFF" },
+    ].map(choice => ({ ...choice, disabled: !known || modFast.writing })), selected, label, value => void modFastWrite(value === "null" ? null : value === "true"))]);
+  }
+  const state = $("#mod-fast-status");
+  state.textContent = modFast.writing ? t("slots.saving") : modFast.error || (known ? t("mod.fast.synced") : t("mod.fast.loading"));
+  state.classList.toggle("bad-text", Boolean(modFast.error));
+}
+function modFastMount() {
+  const root = $("#mod-fast");
+  if (!root.firstChild) {
+    root.replaceChildren(modCard("fast", t("mod.fast.title"), t("mod.fast.blurb"), [modSection(null, [
+      cell(t("mod.fast.mode"), el("div", { id: "mod-fast-control", tabindex: "-1" }), el("span", { id: "mod-fast-status", class: "cell-sub", role: "status" }), "wide"),
+    ], [t("mod.fast.help"), t("mod.fast.scope")])]));
+  }
+  modFastRenderState();
+  void modFastRead();
+}
+function modFastPoll() {
+  if (location.hash === "#mod" && !document.hidden) void modFastRead();
+}
+setInterval(modFastPoll, 3000);
+window.addEventListener("focus", modFastPoll);
+document.addEventListener("visibilitychange", modFastPoll);
+
 // ---- Saving
 
 function modStatus(text, isError) {
@@ -2628,6 +2721,7 @@ async function saveMod() {
   }
 }
 async function loadMod() {
+  modFastMount();
   // A change still on its way would be overwritten by what the router holds now.
   if (modSaveTimer || modSaving) return;
   let retired = false;
@@ -3139,11 +3233,22 @@ function renderProviderFilter(records) {
 function totalInputOf(usage) {
   return (usage.input || 0) + (usage.cached || 0) + (usage.cacheWrite || 0);
 }
+function requestFastBadge(record) {
+  // Use request-scoped evidence, never today's settings or the free-form note. A requested
+  // priority tier is not proof that the server served it (it can answer with default).
+  if (record.kind === "count_tokens") return null;
+  const served = record.servedTier === "priority";
+  if (!served && record.requestedTier !== "priority") return null;
+  const title = `${t("logs.detail.requestedTier")}: ${record.requestedTier || t("common.notAvailable")} · ${t("logs.detail.servedTier")}: ${record.servedTier || t("common.notAvailable")}`;
+  return el("span", { class: `provider-badge fast-badge${served ? "" : " requested"}`, text: served ? "⚡ fast" : t("logs.fastRequested"), title });
+}
 function requestDetail(record) {
   const details = [
     [t("logs.detail.id"), record.id],
     [t("logs.detail.kind"), record.kind],
     [t("logs.detail.stop"), record.stopReason || t("logs.none")],
+    [t("logs.detail.requestedTier"), record.requestedTier || t("common.notAvailable")],
+    [t("logs.detail.servedTier"), record.servedTier || t("common.notAvailable")],
     [t("logs.detail.uncached"), record.usage ? formatNumber(record.usage.input) : t("logs.none")],
     [t("logs.detail.cacheRead"), record.usage && record.usage.cached ? formatNumber(record.usage.cached) : t("logs.none")],
     [t("logs.detail.cacheWrite"), record.usage && record.usage.cacheWrite ? formatNumber(record.usage.cacheWrite) : t("logs.none")],
@@ -3159,6 +3264,7 @@ function requestRow(record) {
   const source = record.source ? record.source.replace(/@[^@]*$/, "") : "";
   const model = el("div", { class: "request-models" }, [
     el("span", { class: "model", text: record.target }),
+    requestFastBadge(record),
     source && source !== record.target ? el("span", { class: "small", text: `(${source})` }) : null,
     el("span", { class: `provider-badge ${providerClass(record.provider)}`, text: record.provider }),
   ].filter(Boolean));

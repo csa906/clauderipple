@@ -20,6 +20,7 @@ import { codexClientVersion, latestCodexVersion, parseCodexCatalog } from "./cat
 import fs from "node:fs";
 import path from "node:path";
 import { homeDir } from "../../config.ts";
+import { getSessionFastStore, type SessionFastStore } from "../../session-fast.ts";
 
 export const DEFAULT_BASE = "https://chatgpt.com/backend-api";
 const PING_MS = 15_000;
@@ -207,6 +208,14 @@ export function codexForwardHeaders(headers: http.IncomingHttpHeaders): Record<s
   return out;
 }
 
+// Match Codex's build_routing_hint_header (openai/codex, core/src/client.rs): the edge
+// gets the same model and tier as the body. This is routing intent, not proof of the served tier.
+function routingHintHeaders(body: { model?: unknown; service_tier?: unknown }): Record<string, string> {
+  const safe = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9._:/-]+$/.test(value);
+  if (!safe(body.model) || (body.service_tier !== undefined && !safe(body.service_tier))) return {};
+  return { "x-codex-routing-hint": `model=${body.model}${body.service_tier !== undefined ? `;tier=${body.service_tier}` : ""}` };
+}
+
 function sendOpenAiError(res: http.ServerResponse, status: number, type: string, message: string, note: string, resetsInSeconds?: number): ChatGptOutcome {
   const body = JSON.stringify({ error: { type, message, ...(resetsInSeconds ? { resets_in_seconds: resetsInSeconds } : {}) } });
   if (!res.headersSent) res.writeHead(status, { "content-type": "application/json", ...(resetsInSeconds ? { "retry-after": String(resetsInSeconds) } : {}) }).end(body);
@@ -269,6 +278,7 @@ export class ChatGptAdapter {
   readonly name: string;
   private readonly cfg: ChatGptProvider;
   private readonly accounts: ChatGptAccountPool;
+  private readonly sessionFast: SessionFastStore;
   /** Cooldowns and conversation stickiness, shared with the proxy's other credential pools. */
   private readonly pool: CredentialPool;
   private readonly log: Logger;
@@ -280,6 +290,7 @@ export class ChatGptAdapter {
   constructor(name: string, cfg: ChatGptProvider, home: string, log: Logger, pool = new CredentialPool(), fetchImpl?: FetchLike) {
     this.name = name;
     this.cfg = cfg;
+    this.sessionFast = getSessionFastStore(home);
     this.log = log;
     this.pool = pool;
     this.accounts = new ChatGptAccountPool({ home, mode: cfg.auth ?? "auto", log, ...(fetchImpl ? { fetch: fetchImpl } : {}) });
@@ -992,10 +1003,12 @@ export class ChatGptAdapter {
    * outcome lands in the request log. `replay: false` is the retry after the backend refused that
    * carrier, and it puts back exactly the request this adapter sent before any of this existed.
    */
-  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true): TranslateOptions {
+  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true, fastOverride: boolean | null = null): TranslateOptions {
     return {
       model,
       effort: effort ?? this.cfg.defaultEffort ?? "high",
+      ...(this.cfg.defaultServiceTier !== undefined ? { defaultServiceTier: this.cfg.defaultServiceTier } : {}),
+      fastOverride,
       identity: this.cfg.identity ?? true,
       ...(this.cfg.instructionsAppend ? { instructionsAppend: this.cfg.instructionsAppend } : {}),
       replay,
@@ -1021,8 +1034,10 @@ export class ChatGptAdapter {
     const serverTools = serverToolNames(json.tools);
     if (serverTools.size > 0) this.log.warn(`chatgpt ${this.name}: dropped server tools for ${model}: ${[...serverTools].join(", ")} (Anthropic runs these; this provider cannot)`);
 
+    // Snapshot the global Fast setting once: a bar click affects the next request, not this turn's retries.
+    const fastOverride = this.sessionFast.getGlobal();
     const carried = { replayed: 0, undecodable: 0 };
-    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort));
+    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort, true, fastOverride));
     let body = JSON.stringify(upstreamReq);
     const cacheKey = upstreamReq.prompt_cache_key;
     // Input estimate for message_start: a conversation only grows, so the last measured total is a floor.
@@ -1053,6 +1068,7 @@ export class ChatGptAdapter {
           "thread-id": cacheKey,
           "x-client-request-id": cacheKey,
           "x-codex-window-id": `${cacheKey}:0`,
+          ...routingHintHeaders(upstreamReq),
           ...(turnState ? { "x-codex-turn-state": turnState } : {}),
         };
       },
@@ -1064,7 +1080,7 @@ export class ChatGptAdapter {
     // must never be the reason a user's turn fails (reasoning.ts).
     if (carried.replayed > 0 && sent.kind === "refused" && refusesReplayedReasoning(sent.status, sent.text)) {
       this.log.warn(`chatgpt ${this.name}: upstream ${sent.status} refused ${carried.replayed} replayed reasoning item(s) for ${model}; asking again without them: ${sent.text.slice(0, 200)}`);
-      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false));
+      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false, fastOverride));
       body = JSON.stringify(upstreamReq);
       carried.replayed = 0;
       sent = await ask();
@@ -1215,7 +1231,7 @@ export class ChatGptAdapter {
       bytes,
       note: failure
         ? `${wantStream ? "mid-stream " : ""}${failure.type}: ${failure.message} (in=${u.input_tokens} cached=${u.cache_read_input_tokens} out=${u.output_tokens} replayed=${carried.replayed} reasoning=${mapper.reasoningCount})`
-        : `in=${u.input_tokens} cached=${u.cache_read_input_tokens} out=${u.output_tokens} stop=${mapper.stopReason} replayed=${carried.replayed} reasoning=${mapper.reasoningCount}${upstreamReq.service_tier ? " fast" : ""}`,
+        : `in=${u.input_tokens} cached=${u.cache_read_input_tokens} out=${u.output_tokens} stop=${mapper.stopReason} replayed=${carried.replayed} reasoning=${mapper.reasoningCount}${upstreamReq.service_tier === "priority" ? " fast" : ""}`,
       usage: {
         input: u.input_tokens,
         cached: u.cache_read_input_tokens,

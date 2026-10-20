@@ -2,6 +2,14 @@
 
 const I18N = {
   ko: {
+    "mod.fast.title": "GPT Fast · 전체 세션",
+    "mod.fast.blurb": "Ripple bar의 ⚡ Fast와 같은 하나의 전역 설정입니다. 모든 세션의 다음 GPT 요청부터 적용됩니다.",
+    "mod.fast.mode": "Fast 모드",
+    "mod.fast.loading": "서버 상태 확인 중…", "mod.fast.synced": "서버와 동기화됨 · 3초마다 갱신",
+    "mod.fast.help": "ON: GPT priority 요청 · OFF: priority 사용 안 함 · Auto: 원래 요청 및 프로바이더 기본값 사용. 실제 제공 여부와 사용량 차감은 공급자 정책을 따릅니다.",
+    "mod.fast.scope": "모든 세션이 같은 값을 공유합니다. Claude 자체 /fast는 변경하지 않습니다.",
+    "mod.fast.invalidReply": "서버가 올바른 전체 Fast 상태를 반환하지 않았습니다.",
+    "logs.fastRequested": "⚡ fast 요청", "logs.detail.requestedTier": "요청 서비스 티어", "logs.detail.servedTier": "응답 서비스 티어",
     "brand": "ClaudeRipple",
     "nav.health": "상태", "nav.slots": "모델 매핑", "nav.providers": "프로바이더", "nav.clients": "클라이언트", "nav.logs": "로그", "nav.about": "정보",
     "lang.label": "언어",
@@ -208,6 +216,14 @@ const I18N = {
     "mod.modeRemoveConfirm": "‘{name}’ 모드를 삭제하시겠습니까?",
   },
   en: {
+    "mod.fast.title": "GPT Fast · all sessions",
+    "mod.fast.blurb": "The same single global setting as ⚡ Fast in the Ripple bar. Applies to the next GPT request of every session.",
+    "mod.fast.mode": "Fast mode",
+    "mod.fast.loading": "Reading server state…", "mod.fast.synced": "Synced with server · refreshes every 3 seconds",
+    "mod.fast.help": "ON: request GPT priority · OFF: suppress priority · Auto: use the original request and provider defaults. Actual service and usage charges depend on the provider.",
+    "mod.fast.scope": "All sessions share this one value. Native Claude /fast is unchanged.",
+    "mod.fast.invalidReply": "The server did not return a valid global Fast state.",
+    "logs.fastRequested": "⚡ fast requested", "logs.detail.requestedTier": "Requested service tier", "logs.detail.servedTier": "Served service tier",
     "brand": "ClaudeRipple",
     "nav.health": "Status", "nav.slots": "Model mapping", "nav.providers": "Providers", "nav.clients": "Clients", "nav.logs": "Logs", "nav.about": "About",
     "lang.label": "Language",
@@ -414,6 +430,7 @@ const I18N = {
     "mod.modeRemoveConfirm": "Delete the mode “{name}”?",
   },
   zh: {
+    "logs.fastRequested": "⚡ fast 已请求", "logs.detail.requestedTier": "请求服务层级", "logs.detail.servedTier": "响应服务层级",
     "brand": "ClaudeRipple",
     "nav.health": "状态",
     "nav.slots": "模型映射",
@@ -904,6 +921,7 @@ const I18N = {
     "mod.modeRemoveConfirm": "删除模式“{name}”？",
   },
   ja: {
+    "logs.fastRequested": "⚡ fast リクエスト", "logs.detail.requestedTier": "リクエストのサービスティア", "logs.detail.servedTier": "応答のサービスティア",
     "brand": "ClaudeRipple",
     "nav.health": "ステータス",
     "nav.slots": "モデルマッピング",
@@ -1394,6 +1412,7 @@ const I18N = {
     "mod.modeRemoveConfirm": "モード「{name}」を削除しますか？",
   },
   es: {
+    "logs.fastRequested": "⚡ fast solicitado", "logs.detail.requestedTier": "Nivel de servicio solicitado", "logs.detail.servedTier": "Nivel de servicio recibido",
     "brand": "ClaudeRipple",
     "nav.health": "Estado",
     "nav.slots": "Asignación de modelos",
@@ -1884,6 +1903,7 @@ const I18N = {
     "mod.modeRemoveConfirm": "¿Eliminar el modo «{name}»?",
   },
   pt: {
+    "logs.fastRequested": "⚡ fast solicitado", "logs.detail.requestedTier": "Nível de serviço solicitado", "logs.detail.servedTier": "Nível de serviço recebido",
     "brand": "ClaudeRipple",
     "nav.health": "Status",
     "nav.slots": "Mapeamento de modelos",

@@ -77,7 +77,8 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
   }
   if (extra.length > 0) {
     const existing = Array.isArray(j.additional_model_options) ? (j.additional_model_options as unknown[]) : [];
-    j.additional_model_options = [...existing, ...extra];
+    // The CLI's bootstrap schema requires a string description on every option; one missing rejects the whole bootstrap.
+    j.additional_model_options = [...existing, ...extra.map((m) => ({ ...m, description: m.description ?? m.name ?? m.model }))];
   }
   if (anyWindow) {
     const acw = { ...((j.auto_compact_windows as Record<string, number> | undefined) ?? {}) };

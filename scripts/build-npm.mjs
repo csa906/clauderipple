@@ -17,11 +17,13 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(root, "dist");
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+// Execute the installed compiler with Node: execFileSync cannot launch npm.cmd on Windows.
+// The tray's build is also tsc (packages/app/package.json); neither step needs a shell.
+const tsc = path.join(root, "node_modules", "typescript", "bin", "tsc");
 
 fs.rmSync(dist, { recursive: true, force: true });
-execFileSync(npm, ["exec", "--", "tsc", "-p", "tsconfig.build.json"], { cwd: root, stdio: "inherit" });
-execFileSync(npm, ["--workspace", "@clauderipple/app", "run", "build"], { cwd: root, stdio: "inherit" });
+execFileSync(process.execPath, [tsc, "-p", "tsconfig.build.json"], { cwd: root, stdio: "inherit" });
+execFileSync(process.execPath, [tsc, "-p", "tsconfig.json"], { cwd: path.join(root, "packages", "app"), stdio: "inherit" });
 
 fs.cpSync(path.join(root, "packages", "ui"), path.join(dist, "ui"), { recursive: true });
 // The status mod is loaded by Claude Code itself, as TypeScript; the API types it writes beside the

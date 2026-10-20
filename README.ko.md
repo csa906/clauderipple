@@ -8,6 +8,8 @@
 
 <h1 align="center">ClaudeRipple</h1>
 
+> **개인 커스텀 브랜치:** 원본 0.9.5에 전역 GPT Fast 제어 등 로컬 패치를 반영했습니다. 변경 내용과 빌드 방법은 [커스텀 패치 안내](docs/CUSTOM_PATCHES.md)를 참고하세요. 원본 npm 패키지에는 이 브랜치 전용 변경이 포함되지 않습니다.
+
 <p align="center"><a href="README.md">English</a> · <b>한국어</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português (BR)</a></p>
 
 <p align="center">

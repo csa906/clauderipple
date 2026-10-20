@@ -1,9 +1,11 @@
-// Edit ~/.claude/settings.json: only the two env keys the CLI reads for the proxy.
-// Always backs up first; never touches any other key; refuses to overwrite a foreign proxy unless forced.
+// Edit ~/.claude/settings.json: proxy, model-slot and opt-in native Fast startup settings.
+// Back up first, preserve unrelated settings, and track ownership of generated Fast values separately.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { atomicJsonWrite, prepareNativeFastMode, commitNativeFastMode } from "./native-fast-mode.ts";
+import type { NativeFastPlan } from "./native-fast-mode.ts";
 
 /** Slots whose env value this call actually wrote or removed. Empty when the file already agreed. */
 export type SlotName = "main" | "smallFast" | "subagent";
@@ -23,15 +25,28 @@ function readSettings(file: string): Record<string, unknown> {
 
 function backup(file: string): string | null {
   if (!fs.existsSync(file)) return null;
-  const ts = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
-  const b = `${file}.bak-clauderipple-${ts}`;
-  fs.copyFileSync(file, b);
+  const base = `${file}.bak-clauderipple-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  let b = base;
+  let suffix = 0;
+  while (fs.existsSync(b)) b = `${base}-${++suffix}`;
+  fs.copyFileSync(file, b, fs.constants.COPYFILE_EXCL);
   return b;
 }
 
 function write(file: string, obj: Record<string, unknown>): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2) + "\n");
+  atomicJsonWrite(file, obj);
+}
+
+function saveEnvironment(file: string, before: Record<string, unknown>, env: Record<string, string>, changed: boolean, fast: NativeFastPlan | null): void {
+  const save = (): void => {
+    if (!changed) return;
+    if (JSON.stringify(readSettings(file)) !== JSON.stringify(before)) throw new Error("settings.json changed during synchronization; retry without overwriting the newer settings");
+    const next = { ...before };
+    if (Object.keys(env).length > 0) next.env = env;
+    else delete next.env;
+    write(file, next);
+  };
+  commitNativeFastMode(fast, save);
 }
 
 /**
@@ -58,10 +73,10 @@ export function checkProxyEnv(opts: { proxyUrl: string; force: boolean }): void 
   refuseForeignProxy(currentProxyEnv().HTTPS_PROXY, opts.proxyUrl, opts.force);
 }
 
-export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: boolean; maxContextTokens?: number; models?: ModelSlots; preserveUnnamedSlots?: boolean }): SettingsEdit {
+export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: boolean; maxContextTokens?: number; models?: ModelSlots; preserveUnnamedSlots?: boolean; gptFastModels?: string[] }): SettingsEdit {
   const file = settingsPath();
   const s = readSettings(file);
-  const env = { ...((s.env as Record<string, string> | undefined) ?? {}) };
+  let env = { ...((s.env as Record<string, string> | undefined) ?? {}) };
   const notes: string[] = [];
   const existing = env.HTTPS_PROXY;
   refuseForeignProxy(existing, opts.proxyUrl, opts.force);
@@ -101,9 +116,16 @@ export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: b
       }
     }
   }
-  if (!changed) return { changed: false, backup: null, notes, wroteSlots: [] };
-  const b = backup(file);
-  write(file, { ...s, env });
+  const fast = prepareNativeFastMode(file, env, opts.gptFastModels);
+  if (fast) {
+    env = fast.env;
+    changed ||= fast.changed;
+    notes.push(...fast.notes);
+  }
+  if (!changed && !fast?.stateChanged) return { changed: false, backup: null, notes, wroteSlots: [] };
+  const b = changed ? backup(file) : null;
+  saveEnvironment(file, s, env, changed, fast);
+  if (fast?.changed) notes.push("native GPT Fast startup settings synchronized; existing server/managed-policy denials are unchanged");
   return { changed: true, backup: b, notes, wroteSlots };
 }
 
@@ -124,14 +146,14 @@ export function applyProxyEnv(opts: { proxyUrl: string; caPath: string; force: b
  * A slot the GUI does not name at all is left alone, so a save here cannot undo a value someone
  * set by hand or through `install`.
  */
-export function syncModelSlots(opts: { proxyUrl: string; caPath: string; force: boolean; models?: ModelSlots }): SettingsEdit {
+export function syncModelSlots(opts: { proxyUrl: string; caPath: string; force: boolean; models?: ModelSlots; gptFastModels?: string[] }): SettingsEdit {
   return applyProxyEnv({ ...opts, preserveUnnamedSlots: true });
 }
 
 export function removeProxyEnv(opts: { proxyUrl: string; caPath: string }): SettingsEdit {
   const file = settingsPath();
   const s = readSettings(file);
-  const env = { ...((s.env as Record<string, string> | undefined) ?? {}) };
+  let env = { ...((s.env as Record<string, string> | undefined) ?? {}) };
   const notes: string[] = [];
   let changed = false;
   if (env.HTTPS_PROXY === opts.proxyUrl) {
@@ -150,12 +172,21 @@ export function removeProxyEnv(opts: { proxyUrl: string; caPath: string }): Sett
       changed = true;
     }
   }
-  if (!changed) return { changed: false, backup: null, notes, wroteSlots: [] };
-  const b = backup(file);
-  const next = { ...s };
-  if (Object.keys(env).length === 0) delete next.env;
-  else next.env = env;
-  write(file, next);
+  let fast: NativeFastPlan | null = null;
+  try {
+    fast = prepareNativeFastMode(file, env, []);
+    if (fast) {
+      env = fast.env;
+      changed ||= fast.changed;
+      notes.push(...fast.notes);
+    }
+  } catch (error) {
+    // Unknown ownership must not leave a known proxy pointing at an uninstalled router.
+    notes.push(`left native Fast settings unchanged: ${(error as Error).message}`);
+  }
+  if (!changed && !fast?.stateChanged) return { changed: false, backup: null, notes, wroteSlots: [] };
+  const b = changed ? backup(file) : null;
+  saveEnvironment(file, s, env, changed, fast);
   return { changed: true, backup: b, notes, wroteSlots: [] };
 }
 

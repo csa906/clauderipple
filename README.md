@@ -8,6 +8,8 @@
 
 <h1 align="center">ClaudeRipple</h1>
 
+> **Personal customization branch:** this branch preserves local patches on top of upstream 0.9.5, including the global GPT Fast control. See [custom patches and build instructions](docs/CUSTOM_PATCHES.md). The upstream npm package does not include these branch-only changes.
+
 <p align="center"><b>English</b> · <a href="README.ko.md">한국어</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português (BR)</a></p>
 
 <p align="center">

@@ -30,6 +30,7 @@ export { adminPort } from "./config.ts";
 import { generatedAgents } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
 import { ModSettingsInputError, readModSettings, validateSettings, validateSettingsSchema, writeModSettings } from "./mod-settings.ts";
+import { getSessionFastStore, SessionFastInputError, type SessionFastStore } from "./session-fast.ts";
 import { billingOf, claudeChoices, fillLadder, ladderNeedsFill } from "../../mod/hooks/ladder.ts";
 import { normalizeSettings } from "../../mod/hooks/settings.ts";
 import type { Billing, Effort, LadderChoice, Settings } from "../../mod/types/index.d.ts";
@@ -54,6 +55,7 @@ import { caTrusted, currentAppProxy } from "../../cli/src/picker.ts";
 import { certPaths } from "../../cli/src/certs.ts";
 import { desktopClaudeCodeDirs } from "../../cli/src/claude-auth.ts";
 import { statusModEnabled, syncModelSlots } from "../../cli/src/settings.ts";
+import { gptFastModelsForConfig } from "../../cli/src/native-fast-mode.ts";
 import { ClaudeOAuthSession, type ClaudeOAuthState } from "./providers/claude-oauth.ts";
 import { readClaudeAuthFile } from "./providers/anthropic-token-file.ts";
 import { listClaudeAccounts, removeClaudeAccount, renameClaudeAccount, setPreferredClaudeAccount } from "./providers/anthropic-accounts.ts";
@@ -88,6 +90,8 @@ const MIME: Record<string, string> = {
 
 export type AdminDeps = {
   config: () => Config;
+  /** Optional: the global ChatGPT Fast store; defaults to the one persisted under the home directory. */
+  sessionFast?: SessionFastStore;
   configFile: string;
   log: Logger;
   stats: () => Stats;
@@ -759,6 +763,7 @@ function syncModelSlotsForGui(cfg: Config): string | null {
       // Always an object, never omitted: `cli.models` absent means every slot should be back on
       // Claude, and `syncModelSlots` reads an absent `models` as "do not touch these".
       models: cfg.cli.models ?? {},
+      gptFastModels: gptFastModelsForConfig(cfg),
     });
     return null;
   } catch (e) {
@@ -1594,6 +1599,7 @@ function serveStatic(urlPath: string, res: http.ServerResponse): void {
 }
 
 export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): void }> {
+  const sessionFast = deps.sessionFast ?? getSessionFastStore(homeDir());
   const scores = new ModelScoreCatalog({ home: homeDir(), warn: message => deps.log.warn(message), ...(deps.modelScoresFetch ? { fetch: deps.modelScoresFetch } : {}) });
   // Set again once the socket is bound (port 0 in tests); the Origin check below compares against it.
   let boundPort = adminPort(deps.config());
@@ -1652,6 +1658,37 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       if (pathname === "/api/status" && method === "GET") {
         const refresh = new URL(url, "http://127.0.0.1").searchParams.get("refresh") === "1";
         sendJson(res, 200, await buildStatus(deps, { refresh }));
+        return;
+      }
+      if (pathname === "/api/fast" && method === "GET") {
+        sendJson(res, 200, sessionFast.snapshotGlobal());
+        return;
+      }
+      if (pathname === "/api/fast" && method === "PUT") {
+        const bytes = await readBody(req, MAX_BODY, new SessionFastInputError("body too large", 413));
+        let body: unknown;
+        try { body = JSON.parse(bytes.toString("utf8")); }
+        catch { throw new SessionFastInputError("invalid JSON"); }
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 1 || !Object.hasOwn(body, "fast"))
+          throw new SessionFastInputError("expected fast");
+        sendJson(res, 200, sessionFast.setGlobal((body as { fast?: unknown }).fast));
+        return;
+      }
+      // Legacy alias of the global setting for older bar clients; the session id is only validated.
+      if (pathname === "/api/session-fast" && method === "GET") {
+        const session = new URL(url, "http://127.0.0.1").searchParams.get("session");
+        sendJson(res, 200, sessionFast.snapshot(session));
+        return;
+      }
+      if (pathname === "/api/session-fast" && method === "PUT") {
+        const bytes = await readBody(req, MAX_BODY, new SessionFastInputError("body too large", 413));
+        let body: unknown;
+        try { body = JSON.parse(bytes.toString("utf8")); }
+        catch { throw new SessionFastInputError("invalid JSON"); }
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "session" && key !== "fast"))
+          throw new SessionFastInputError("expected session and fast");
+        const input = body as { session?: unknown; fast?: unknown };
+        sendJson(res, 200, sessionFast.set(input.session, input.fast));
         return;
       }
       if (pathname === "/api/mod-settings" && method === "GET") {
@@ -2386,7 +2423,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       }
       sendJson(res, 404, { error: "not found" });
     } catch (e) {
-      if (e instanceof ModSettingsInputError && !res.headersSent) {
+      if ((e instanceof ModSettingsInputError || e instanceof SessionFastInputError) && !res.headersSent) {
         sendJson(res, e.status, { error: e.message });
         return;
       }

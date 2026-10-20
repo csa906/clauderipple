@@ -49,6 +49,9 @@ export type RouteView = {
   note?: string
 }
 
+/** This session's GPT Fast as the control shows it: auto inherits, on is priority, off forces standard; unavailable is unknown. */
+export type FastState = 'auto' | 'on' | 'off' | 'unavailable'
+
 export type DashboardView = {
   effort: {
     level: Effort | null
@@ -89,6 +92,8 @@ export type DashboardView = {
   isWorking: boolean
   /** The active operating mode's name; absent when none is on. */
   mode?: string
+  /** GPT Fast for this session; absent in a view that predates it (then no control is drawn). */
+  fast?: { state: FastState; busy: boolean }
 }
 
 export type BandActions = {
@@ -106,6 +111,8 @@ export type BandActions = {
   pickEffort: (effort: Effort) => void
   /** Hides the band (desktop: its × is drawn inside the band). */
   hide?: () => void
+  /** Turns this session's GPT Fast on or off (from Auto, on); drawn only with `view.fast`. */
+  toggleFast?: () => void
 }
 
 // ---- Alerts and cards ------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 // Timers own background work; hooks only admit/rewrite a request and record its result.
 import { atom, read, update } from 'claude-code'
 import type { AgentSpawnInput, EngineInterface, ModelCompleteResult, ModelForkResult, Register, RenderElement, RenderInput, SessionRateLimit, ToolCallInput, TurnStepInput, TurnUsage } from 'claude-code'
-import type { AgentRec, Effort, JudgeInput, JudgeKind, JudgeRun, ModSettingsSnapshot, Pick, Settings, StatusRequest, TierTarget, Verdict, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
+import type { AgentRec, Effort, GptFast, JudgeInput, JudgeKind, JudgeRun, ModSettingsSnapshot, Pick, Settings, StatusRequest, TierTarget, Verdict, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
 import { MOD_SETTINGS_SCHEMA_VERSION, applySettingsChanges, normalizeSettings, settingsChanges } from './settings'
 import { debugText, langFrom, t } from './i18n'
 import type { Lang } from './i18n'
@@ -24,7 +24,7 @@ import { renderSetup } from './ui/setup'
 import { renderAgents } from './ui/agents'
 import { renderLog } from './ui/log'
 import { EFFORTS, modelName, nextMinuteChange, routeOf, targetLabel } from './ui/view'
-import type { AlertActions, AlertView, BandActions, DashboardView, Frame, SettingsActions, SettingsView, SetupActions } from './ui/view'
+import type { AlertActions, AlertView, BandActions, DashboardView, FastState, Frame, SettingsActions, SettingsView, SetupActions } from './ui/view'
 
 const line = atom({ plugin: 'ripple', key: 'line' } as const, null)
 const last = atom({ plugin: 'ripple', key: 'last' } as const, null)
@@ -87,6 +87,8 @@ const routerModels = atom({ plugin: 'ripple', key: 'routerModels' } as const, []
 const ladderOptions = atom({ plugin: 'ripple', key: 'ladderOptions' } as const, null)
 const modeNoted = atom({ plugin: 'ripple', key: 'modeNoted' } as const, null)
 const demo = atom({ plugin: 'ripple', key: 'demo' } as const, null)
+// Shared GPT Fast: only what the router last acknowledged, never a preference kept here.
+const gptFast = atom({ plugin: 'ripple', key: 'gptFast' } as const, { status: 'unknown', scope: null, value: null, revision: 0, writing: false } as GptFast)
 
 /**
  * Whether a state write would change anything. A write redraws each reader, and a redraw that
@@ -726,6 +728,93 @@ async function toggleWarm($: EngineInterface): Promise<void> {
   await update($, warmHere, () => on === s.keepWarm ? null : on)
   if (on) await update($, warm, value => ({ ...value, stopped: undefined }))
 }
+// ---- GPT Fast (all sessions) -------------------------------------------------------------------
+// One router-owned value (GET/PUT /api/fast) is shared by every bar and the dashboard. A change
+// applies to the next request in every session; nothing already in flight is touched.
+let fastWriting = false
+let fastPolling = false
+let fastEpoch = 0
+function fastReply(text: string): { fast: boolean | null; revision: number } {
+  const body = object(JSON.parse(text))
+  const fast = body.fast
+  const revision = body.revision
+  if (body.scope !== 'global' || (fast !== null && typeof fast !== 'boolean') || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) throw new Error('invalid global fast snapshot')
+  return { fast, revision }
+}
+/** Takes a validated snapshot unless the one held is newer. Old per-session atoms are not global acknowledgements. */
+async function acceptFast($: EngineInterface, reply: { fast: boolean | null; revision: number }, epoch = fastEpoch): Promise<void> {
+  const apply = (held: GptFast): GptFast => {
+    if (epoch !== fastEpoch || (held.scope === 'global' && reply.revision < held.revision)) return held
+    const next: GptFast = { status: 'ready', scope: 'global', value: reply.fast, revision: reply.revision, writing: held.writing }
+    return same(held, next) ? held : next
+  }
+  const held = await read($, gptFast)
+  // update retries on an atom-version conflict; recheck the revision inside that retry too.
+  if (apply(held) !== held) await update($, gptFast, apply)
+}
+/** The router could not say (down, too old, or an answer that does not validate): nothing is assumed. */
+async function fastDown($: EngineInterface, epoch = fastEpoch): Promise<void> {
+  const held = await read($, gptFast)
+  if (epoch !== fastEpoch || held.status === 'unavailable') return
+  // A read failure may have waited behind a successful write, including during an atom retry.
+  await update($, gptFast, value => epoch === fastEpoch ? { ...value, status: 'unavailable' } : value)
+}
+async function refreshFast($: EngineInterface): Promise<void> {
+  if (fastPolling || fastWriting) return
+  fastPolling = true
+  const epoch = fastEpoch
+  try {
+    const response = await $.http.fetch(`${await adminUrl($)}/api/fast`)
+    if (!response.ok) throw new Error(t(await read($, lang), 'commands.routerHttp', { status: response.status }))
+    if (epoch === fastEpoch) await acceptFast($, fastReply(response.text), epoch)
+  } catch (error) {
+    if (epoch === fastEpoch) { await fastDown($, epoch); await report($, 'global fast poll', error) }
+  } finally { fastPolling = false }
+}
+/** Sets GPT Fast globally; the shown value changes only on the router's own answer. */
+async function writeFast($: EngineInterface, target: boolean | null): Promise<{ ok: true } | { ok: false; reason: string; busy?: true }> {
+  const language = await read($, lang)
+  if (fastWriting) return { ok: false, reason: t(language, 'fast.saving'), busy: true }
+  fastWriting = true
+  ++fastEpoch
+  try {
+    await update($, gptFast, value => ({ ...value, writing: true }))
+    const response = await $.http.fetch(`${await adminUrl($)}/api/fast`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ fast: target }) })
+    if (!response.ok) throw new Error(t(language, 'commands.routerHttp', { status: response.status }))
+    const reply = fastReply(response.text)
+    if (reply.fast !== target) throw new Error('router answered another value')
+    const held = await read($, gptFast)
+    if (held.scope === 'global' && reply.revision < held.revision) throw new Error('router answered an older revision')
+    await acceptFast($, reply)
+    return { ok: true }
+  } catch (error) {
+    // The router may have saved the value before the acknowledgement was lost. A later GET
+    // reconciles it; do not keep presenting the previous value as confirmed or retry the PUT.
+    await fastDown($)
+    await report($, 'global fast write', error)
+    return { ok: false, reason: reason(error) }
+  } finally {
+    fastWriting = false
+    await update($, gptFast, value => ({ ...value, writing: false }))
+  }
+}
+/** The band's lightning changes the shared value: Auto/OFF -> ON, ON -> OFF. */
+async function toggleFast($: EngineInterface): Promise<void> {
+  const language = await read($, lang)
+  if (fastWriting) return
+  const held = await read($, gptFast)
+  if (fastState(held) === 'unavailable') {
+    await refreshFast($)
+    if (fastState(await read($, gptFast)) === 'unavailable') await $.ui.toast(t(language, 'toasts.fastUnavailable'))
+    return
+  }
+  const done = await writeFast($, held.value !== true)
+  if (!done.ok && !done.busy) await $.ui.toast(t(language, 'toasts.fastFailed', { reason: done.reason }))
+}
+function fastState(held: GptFast): FastState {
+  if (held.status !== 'ready' || held.scope !== 'global') return 'unavailable'
+  return held.value === null ? 'auto' : held.value ? 'on' : 'off'
+}
 async function toggleSave($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
   const active = (await read($, saveUntil) ?? 0) > now
@@ -1041,8 +1130,8 @@ async function tick($: EngineInterface): Promise<void> {
 function startTimers($: EngineInterface): void {
   if (timersStarted) return
   timersStarted = true
-  $.clock.after(1, async () => { await refreshRouter($); await tick($) })
-  $.clock.every(3000, async () => { await refreshRouter($) })
+  $.clock.after(1, async () => { await refreshRouter($); await refreshFast($); await tick($) })
+  $.clock.every(3000, async () => { await refreshRouter($); await refreshFast($) })
   $.clock.every(15000, async () => { await tick($) })
 }
 
@@ -1065,6 +1154,7 @@ async function dashboard($: EngineInterface, working: boolean): Promise<Dashboar
     agents: { live: list.filter(a => ['running', 'waiting'].includes(a.state)).length, total: list.length },
     logOpen: await read($, logOpen), agentsOpen: await read($, agentsOpen), effortMenu: await read($, effortMenuOpen),
     swampAt: s.swampAt, hide: s.hide, extras: s.extras, isWorking: working,
+    fast: { state: fastState(await read($, gptFast)), busy: (await read($, gptFast)).writing },
     ...(activeModeOf(s) ? { mode: activeModeOf(s)!.name } : {}),
   }
 }
@@ -1132,7 +1222,7 @@ async function dismiss($: EngineInterface, view: AlertView): Promise<void> {
 }
 function bandActions($: EngineInterface, surface: Frame['surface']): BandActions {
   return { toggleAuto: () => toggleAuto($), toggleWarm: () => toggleWarm($), compact: () => openCompact($, surface), clear: () => openClear($), handoff: () => openHandoff($), toggleLog: () => toggleLog($), toggleAgents: () => toggleAgents($), openSettings: () => startPanel($, 'settings'),
-    toggleEffortMenu: () => update($, effortMenuOpen, value => !value), pickEffort: effort => manualPick($, effort) }
+    toggleEffortMenu: () => update($, effortMenuOpen, value => !value), pickEffort: effort => manualPick($, effort), toggleFast: () => toggleFast($) }
 }
 function settingsActions($: EngineInterface): SettingsActions {
   return { patch: async change => {
@@ -1216,6 +1306,7 @@ export const register: Register = on => {
       await $.command.register({ name: 'ripple', description: t(language, 'commands.description'), argumentHint: t(language, 'commands.argumentHint'), immediate: true })
       await $.command.register({ name: 'ripple-log', description: t(language, 'commands.logDescription'), immediate: true })
       await $.command.register({ name: 'ripple-bar', description: t(language, 'commands.barDescription'), immediate: true })
+      await $.command.register({ name: 'ripple-fast', description: t(language, 'commands.fastDescription'), argumentHint: t(language, 'commands.fastArgumentHint'), immediate: true })
       // loadSettings skips the install when an earlier poll already took this revision, and that
       // poll may have run before the session bound: register here, where it is bound.
       await registerAuto($, await currentSettings($))
@@ -1488,6 +1579,21 @@ export const register: Register = on => {
       // The minimal layout draws no band above the prompt, only the short line under it (#56).
       return { text: t(language, (await currentSettings($)).layout === 'minimal' ? 'commands.barShownMinimal' : 'commands.barShown') } }
     catch (error) { await report($, 'ripple-bar', error); return next(e) }
+  })
+  on('command.run', { command: 'ripple-fast' }, async ($, e, next) => {
+    try {
+      const language = await read($, lang)
+      const word = e.args.trim().toLowerCase()
+      if (word !== '' && word !== 'on' && word !== 'off' && word !== 'auto') return { text: t(language, 'commands.fastUsage') }
+      if (word === '') {
+        await refreshFast($)
+        const state = fastState(await read($, gptFast))
+        return { text: t(language, 'fast.' + state) + ' · ' + t(language, state === 'unavailable' ? 'fast.downTip' : 'fast.scope') }
+      }
+      const done = await writeFast($, word === 'on' ? true : word === 'off' ? false : null)
+      if (!done.ok) return { text: t(language, 'toasts.fastFailed', { reason: done.reason }) }
+      return { text: t(language, 'commands.fastDone', { state: t(language, word === 'on' ? 'fast.on' : word === 'off' ? 'fast.off' : 'fast.auto') }) }
+    } catch (error) { await report($, 'ripple-fast', error); return next(e) }
   })
   on('ui.close', { id: LOG_PANE }, async ($, e, next) => {
     try { await update($, logOpen, () => false) } catch (error) { await report($, 'log close', error) }

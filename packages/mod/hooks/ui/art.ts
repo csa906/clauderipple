@@ -590,6 +590,26 @@ export function iconArt(icon: Icon, on: boolean, tone: Tone = 'violet'): string 
   return svg(ICON_PX, ICON_PX, glow + '<g fill="none" stroke="' + stroke + '" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">' + ICON[icon] + '</g>', '', lit(on))
 }
 
+const BOLT = 'M9.3 1.4L3.4 9.1h4.1l-.9 5.5 6-7.8H8.4z'
+
+/**
+ * The GPT Fast lightning, 16 px. Auto (inherit): a soft outline. ON: filled and lit amber. OFF: the
+ * outline struck through. Unavailable (unknown, never a guess): dashed and dim. The state is in the
+ * drawing itself, as the other controls' are.
+ */
+export function fastArt(state: 'auto' | 'on' | 'off' | 'unavailable'): string {
+  if (state === 'on') {
+    return svg(ICON_PX, ICON_PX,
+      '<defs><linearGradient id="g" x1="0" x2="0" y1="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fde68a"/></linearGradient><filter id="f" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.3"/></filter></defs>' +
+      '<path filter="url(#f)" opacity=".8" fill="#fbbf24" d="' + BOLT + '"/><path fill="url(#g)" stroke="#fde68a" stroke-width=".6" stroke-linejoin="round" d="' + BOLT + '"/>', '', lit(true))
+  }
+  const dim = state === 'unavailable'
+  const stroke = dim ? MUTE : SOFT
+  const strike = state === 'off' ? '<path d="M2.2 13.8L13.8 2.2" stroke="' + stroke + '" stroke-width="1.5" stroke-linecap="round"/>' : ''
+  return svg(ICON_PX, ICON_PX,
+    '<g fill="none" stroke="' + stroke + '" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"' + (dim ? ' stroke-dasharray="1.6 1.8" opacity=".8"' : '') + '><path d="' + BOLT + '"/></g>' + strike, '', lit(false))
+}
+
 export const AGENTS_W = 26
 
 /** The agents icon with the live count in a lit disc on its shoulder, one width whatever the count. */
