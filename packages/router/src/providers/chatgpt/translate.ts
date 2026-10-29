@@ -11,7 +11,7 @@
 // for a request that is not a conversation at all, from its system prompt (see `conversationKey`).
 
 import crypto from "node:crypto";
-import { identityLine } from "../../identity.ts";
+import { identityLine, type IdentitySurface } from "../../identity.ts";
 import { encodeEnvelope, envelopeFor, isOurSignature, replayableReasoning, type Envelope, type ReplayedReasoning } from "../../reasoning.ts";
 
 // ---- Anthropic side -----------------------------------------------------------------
@@ -84,6 +84,8 @@ export type TranslateOptions = {
   model: string;
   effort: string;
   identity: boolean;
+  /** Which client the identity line names (identity.ts). Default Claude Code. */
+  surface?: IdentitySurface;
   instructionsAppend?: string;
   /**
    * How to make an image through `/api/image`, for the session's own turns. A generated worker has
@@ -370,7 +372,7 @@ export function toResponsesRequest(req: AnthropicRequest, opts: TranslateOptions
   const parts: string[] = [];
   // Effort is named here because the model cannot see its own reasoning setting and will otherwise guess.
   // Constant per (model, effort): changing effort mid-session costs one cache miss, which is acceptable.
-  if (opts.identity) parts.push(identityLine(opts.model, opts.effort));
+  if (opts.identity) parts.push(identityLine(opts.model, opts.effort, opts.surface));
   const sys = systemWithDroppedToolNote(req);
   if (sys) parts.push(sys);
   if (opts.instructionsAppend) parts.push(opts.instructionsAppend);

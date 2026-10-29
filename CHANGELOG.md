@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Your picker models in Claude in Chrome's own model menu** (opt-in: `clauderipple chrome on`).
+  The extension's side-panel chat reads its menu from its own feature payload on api.anthropic.com
+  and cannot be pointed at another host, so Chrome reaches the router through a proxy script
+  (`/chrome.pac` on the admin port) that sends that one host to it and every other site direct.
+  The menu then lists the picker models on non-Anthropic providers after Claude's, and a turn on
+  one of them is routed and told it answers through a browser agent. Everything else the
+  extension sends passes through on its own sign-in: it never uses this router's Claude accounts,
+  a routing marker in a page it read moves nothing, and its token is never taken for Claude
+  Code's. The command prints how to start Chrome with the script in a profile of its own.
+
 ## 0.12.22 — 2026-10-29
 
 ### Added

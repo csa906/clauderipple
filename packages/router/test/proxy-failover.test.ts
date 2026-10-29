@@ -870,7 +870,7 @@ type FRig = {
   chatgpt: Recorder;
   native: Recorder;
   quotaCalls: () => number;
-  post: (body: unknown, disconnect?: Promise<void>) => Promise<{ status: number; headers: http.IncomingHttpHeaders; text: string }>;
+  post: (body: unknown, disconnect?: Promise<void>, headers?: Record<string, string>) => Promise<{ status: number; headers: http.IncomingHttpHeaders; text: string }>;
   records: (n?: number) => Promise<RequestRecord[]>;
   states: () => string[];
   stop: () => Promise<void>;
@@ -882,6 +882,8 @@ async function frig(opts: {
   google?: (hit: Hit, n: number) => Reply;
   quota?: Quota;
   accounts?: number;
+  /** Extra configuration (picker models, the Chrome switch) over the rig's own. */
+  config?: Partial<Config>;
 }): Promise<FRig> {
   const google = await recorder((hit, n) => opts.google ? opts.google(hit, n) : carriesSdk(hit) ? { status: 429, body: JSON.stringify(GENERIC_429) } : googleAnswer(hit));
   const compat = await recorder((hit) => anthropicReply(hit, "compat answer"));
@@ -937,7 +939,7 @@ async function frig(opts: {
     claude: { type: "anthropic", auth: "claude-code", accountPool: true } as Provider,
     ingress: { type: "anthropic", auth: "claude-code" } as Provider,
   };
-  const cfg: Config = { ...DEFAULTS, upstream: "localhost", listen: { host: "127.0.0.1", port: proxyPort }, providers, routes: opts.routes(), direct: [] };
+  const cfg: Config = { ...DEFAULTS, upstream: "localhost", listen: { host: "127.0.0.1", port: proxyPort }, providers, routes: opts.routes(), direct: [], ...opts.config };
   const requests = new RequestLog(path.join(home, "requests.jsonl"));
   const proxy = new Proxy({
     config: () => cfg,
@@ -955,7 +957,7 @@ async function frig(opts: {
   // Seed the quota evidence the way production does: a lookup through the real adapter.
   if ((opts.quota ?? "fresh") !== "none") await proxy.googleUsage("g");
 
-  const post: FRig["post"] = async (body, disconnect) => {
+  const post: FRig["post"] = async (body, disconnect, headers) => {
     const sock = net.connect(proxyPort, "127.0.0.1");
     await new Promise<void>((r) => sock.once("connect", () => r()));
     sock.write("CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n");
@@ -970,7 +972,7 @@ async function frig(opts: {
       secure.once("close", () => clearTimeout(guard));
       const req = http.request({
         agent, method: "POST", path: "/v1/messages",
-        headers: { host: "localhost", "content-type": "application/json", "content-length": Buffer.byteLength(raw), "x-claude-code-session-id": "sess-1" },
+        headers: { host: "localhost", "content-type": "application/json", "content-length": Buffer.byteLength(raw), ...(headers ?? { "x-claude-code-session-id": "sess-1" }) },
       }, (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c: Buffer) => chunks.push(c));
@@ -1528,4 +1530,43 @@ test("no capacity on the fallback too: one fallback only, then the clear 529", a
     assert.equal(r.compat.hits.length, 0, "the cap holds although another fallback was configured");
     assert.deepEqual(r.states(), ["ready"]);
   } finally { restore(); await r.stop(); }
+});
+
+// ---- Claude in Chrome: a Google refusal never hands the extension's turn to this router's Claude accounts ----
+
+const CHROME_HEADERS = {
+  origin: "chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn",
+  "anthropic-client-platform": "claude_browser_extension",
+  authorization: "Bearer extension-token",
+};
+const chromeConfig = (): Partial<Config> => ({
+  cli: { ...DEFAULTS.cli, extraModels: [{ model: "gem-slot", name: "Gem" }] },
+  chromeExtension: { enabled: true },
+});
+const chromeRoute = (fallbacks: { provider: string; model: string }[]): Config["routes"] =>
+  ({ "gem-slot": { provider: "g", model: "gemini-3.8-flash", fallbacks } as Config["routes"][string] });
+
+test("Claude in Chrome: a prompt refusal skips an Anthropic fallback and takes the next one", async () => {
+  const r = await frig({ routes: () => chromeRoute([{ provider: "claude", model: "claude-opus-5" }, { provider: "c", model: "fb-model" }]), config: chromeConfig() });
+  try {
+    const res = await r.post(turn({ model: "gem-slot", thread: undefined, stream: false }), undefined, CHROME_HEADERS);
+    assert.equal(res.status, 200);
+    assert.match(res.text, /compat answer/);
+    assert.equal(r.native.hits.length, 0, "this router's Claude account was never used");
+    assert.equal(r.compat.hits.length, 1);
+    assert.equal(r.compat.hits[0]!.headers.origin, undefined, "the browser's origin is not the vendor's business");
+    assert.equal(r.compat.hits[0]!.headers["anthropic-client-platform"], undefined);
+  } finally { await r.stop(); }
+});
+
+test("Claude in Chrome: with only an Anthropic fallback, the refusal is explained and nothing reaches Anthropic", async () => {
+  const r = await frig({ routes: () => chromeRoute([{ provider: "claude", model: "claude-opus-5" }]), config: chromeConfig() });
+  try {
+    const res = await r.post(turn({ model: "gem-slot", thread: undefined, stream: false }), undefined, CHROME_HEADERS);
+    assert.equal(res.status, 400);
+    assert.equal(r.native.hits.length, 0);
+    const [rec] = await r.records();
+    assert.equal(rec!.refusal, "prompt-incompatible");
+    assert.equal(rec!.client, "chrome-extension");
+  } finally { await r.stop(); }
 });

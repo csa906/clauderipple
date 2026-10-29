@@ -5,7 +5,7 @@
 import crypto from "node:crypto";
 import { clampEffort } from "../../compat.ts";
 import { conversationKey, documentFile, documentResponsePart, documentText, estimateTokens, normalizeSchema, serverToolNames, systemWithDroppedToolNote, toolNameForResponses, type AnthropicBlock, type AnthropicRequest, type AnthropicTool, type ResponsesContentPart } from "../chatgpt/translate.ts";
-import { identityPrefix, instructionsSuffix } from "../../identity.ts";
+import { identityPrefix, instructionsSuffix, type IdentitySurface } from "../../identity.ts";
 import { encodeEnvelope, envelopeFor, replayableReasoning, type Envelope, type ReplayedReasoning } from "../../reasoning.ts";
 
 export type OpenAiWire = "chat" | "responses";
@@ -18,6 +18,8 @@ export type OpenAiTranslateOptions = {
   caps?: OpenAiCaps;
   /** Prefix the system prompt with what the model is. Default true; see identity.ts. */
   identity?: boolean;
+  /** Which client the identity line names. Default Claude Code. */
+  surface?: IdentitySurface;
   /** Fixed configured text after the system prompt. */
   instructionsAppend?: string;
   /**
@@ -181,7 +183,7 @@ function mapResponsesToolChoice(req: AnthropicRequest, tools: ResponsesTool[]): 
 function systemWithIdentity(sys: string, opts: OpenAiTranslateOptions): string {
   // The effort named is the one that survives the capability mapping; a provider that takes no
   // reasoning effort is told none, rather than a level it will never see.
-  return [identityPrefix({ model: opts.model, effort: mappedEffort(opts), identity: opts.identity }), sys, instructionsSuffix({ model: opts.model, instructionsAppend: opts.instructionsAppend })]
+  return [identityPrefix({ model: opts.model, effort: mappedEffort(opts), identity: opts.identity, surface: opts.surface }), sys, instructionsSuffix({ model: opts.model, instructionsAppend: opts.instructionsAppend })]
     .filter(Boolean)
     .join("\n\n");
 }

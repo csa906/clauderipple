@@ -442,6 +442,92 @@ Codex catalogs exclude them; the next enabled agent sync removes previously
 owned Jev files, never hand-written ones. Provider configuration and mod options keep
 them available as judge candidates. Tests: `test/admin.test.ts`, `test/model-policy.test.ts`.
 
+### 3c. Claude in Chrome's own model menu (2026-10-29, opt-in)
+
+Claude in Chrome (extension `fcoeoabgfenejglbffodgkkbkcdhcgfn`) has a side-panel chat of
+its own that calls the Messages API itself, so neither the Desktop picker nor the CLI's
+settings reach it. What it does, read from its bundle (1.0.102) and from the feature
+payload it had cached in `chrome.storage.local` (`features`), 2026-10-29:
+
+- **The menu does not come from the claude.ai bootstrap.** The `chrome` surface the
+  picker log shows there is not what the extension reads. Its options are
+  `features.chrome_ext_models.value.options` of
+  `GET https://api.anthropic.com/api/bootstrap/features/claude_in_chrome` (OAuth
+  Bearer; cached five minutes). When `features.chrome_ext_backend_model_selector.value`
+  is true, it keeps only the options `GET /api/organizations/{org}/model_selector/chrome`
+  also lists in `model_selector_config[0].models`, and the choice is PATCHed to
+  `.../model_selector_state/chrome`. The flag was false on the account checked.
+- **The chosen id goes out verbatim** as the `model` of `POST /v1/messages?beta=true`
+  (a trailing `[fast]` is stripped) from the side panel through the Anthropic SDK. The
+  body has custom browser tools (`computer`, `navigate`, `read_page`, `find`, …, not the
+  `computer_2025…` server tool), base64 screenshots, `cache_control`, `max_tokens: 10000`
+  and no `thinking`/`output_config`. Title and summary calls pass `modelClass:
+  "small_fast"` and go out on `small_fast_model` (`claude-haiku-4-5-20251001` by default)
+  whatever the menu says. Compaction (`compactConversation`, `sampling_compaction`) passes
+  none, so it runs on the selected model, and a routed pick's compaction is routed too.
+- **Every fetch to the API host carries `anthropic-client-platform:
+  claude_browser_extension`** and a `claude-browser-extension/<version>` User-Agent, set by
+  a declarativeNetRequest session rule, so the proxy sees them. The CLI sends neither. The
+  rule has no initiator condition, so a web page's own fetch to the API host is tagged too:
+  the header names a browser, not the extension. What names the extension is the
+  `Origin: chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn` Chrome sets on its POSTs,
+  which no page can forge, with a Bearer sign-in of its own. Claude Code sends no Origin
+  and no `sec-fetch-site`.
+- **The API origin is fixed** (`apiBaseUrl: "https://api.anthropic.com"`), its CSP
+  `connect-src` admits no other host, and the bundled SDK's `ANTHROPIC_BASE_URL` is never
+  read in the browser. A repackaged copy breaks sign-in: the OAuth redirect URI names the
+  extension id. The network path is the only way in.
+
+The design (`packages/router/src/chrome-extension.ts`, `chromeExtension.enabled`, off
+unless set; `clauderipple chrome on|off`):
+
+- **Reaching it.** `GET /chrome.pac` on the admin port serves a PAC that sends
+  `api.anthropic.com`, and only it, to the proxy (`PROXY 127.0.0.1:<port>; DIRECT`).
+  The user starts Chrome with `--proxy-pac-url`, preferably with a `--user-data-dir` of its
+  own: Chrome reads the switch only at start, and a proxy-controlling extension (a VPN)
+  in the everyday profile would win over it. The router already terminates the API host
+  (§1); Chrome trusts the CA in the same user store picker mode uses (Windows
+  `Cert:\CurrentUser\Root`, the login keychain, the NSS database). With the router down,
+  Chrome goes direct: Claude models keep working and a routed id gets Anthropic's own
+  error, a visible failure rather than a silent reroute.
+- **Who is asking** (`requestClient`). The extension is its Origin plus a sign-in; any
+  other request with an Origin, a `sec-fetch-site` or the header is some other browser
+  context (a page, another extension) and is logged `client: "browser"`. That one is never
+  routed, observed or given WebSearch/WebFetch handling: it passes through as it came, so
+  the PAC gives a page in that profile nothing it would not get going direct.
+- **The menu.** For a signed-in request from the extension's Origin (or tagged by its
+  rule and carrying no Origin, as a GET may), the features response gains the picker
+  models (`chatPickerModels`) that are not `claude-*` ids and whose provider is not
+  `type: "anthropic"`: the extension lists its own Claude models, a Claude id it sends
+  stays on its own sign-in even when the picker maps that id elsewhere, and this router's
+  Claude accounts are Claude Code's. Each entry is cloned from the payload's default option; its description, notice,
+  knowledge cutoff, overflow placement and `xml_system_reminders` are dropped (false moves
+  reminders into system turns behind an Anthropic beta), and `effort_options` is narrowed
+  to the low/medium/high the menu takes. The backend list gets the same ids, cloned the
+  Desktop way, so a selector switched on later does not filter them out. Both edits reuse
+  the bootstrap path (decode, edit, new length, no validators). The sticky PATCH is left
+  alone.
+- **Its turns.** An extension turn is routed only on an id the menu offered, resolved
+  without the body, because the extension's messages carry page content and a page can
+  start with a `[[ripple: …]]` marker. A non-Claude id it was not offered is refused (400);
+  a Claude id passes through byte-for-byte on the extension's own sign-in. Its
+  Authorization is never observed as Claude Code's (`observedClaudeCodeAuth`), and WebSearch
+  and WebFetch handling does not apply. `chromeExtensionRoute` drops the slot's fallbacks
+  onto Anthropic providers, and any attempt that still lands on one, a Google prompt-refusal
+  or capacity fallback included, is refused (503, logged `provider: "refused"`). On an
+  Anthropic-compatible target its `origin`, `referer`, `cookie`, `sec-fetch-*`, `sec-ch-*`,
+  `anthropic-client-*` and `anthropic-dangerous-direct-browser-access` headers are not
+  forwarded. A routed turn's identity line names Claude in Chrome (§4c), and the image hint
+  is not added. The request log marks these turns `client: "chrome-extension"`.
+- **Not covered.** The hosted panel (`chrome_ext_cowork_iframe`, `claude.ai/cic/new`
+  in an iframe, chosen once browser-control permission is accepted) runs its model loop
+  on claude.ai's servers and cannot be routed. Small-fast calls and the `find` tool's
+  inner inference stay on Claude. The extension's context gauge assumes 200K whatever the
+  model. Driving Chrome from Claude Code or Cowork already runs on the picker's model
+  (the extension only executes the tools there) and needs none of this.
+
+Tests: `test/chrome-extension.test.ts`, `test/proxy-chrome-extension.test.ts`.
+
 ## 4. Provider adapters
 
 ### Artificial Analysis model scores (2026-10-10)
@@ -1065,6 +1151,10 @@ must preserve **Data: Artificial Analysis (artificialanalysis.ai)** attribution.
 - `identity: false` per provider turns it off; `instructionsAppend` adds fixed
   text after the prompt. Both are constant per provider, so the prompt cache
   misses once when either changes and not afterwards.
+- A turn from Claude in Chrome's own chat (§3c) is told `You are <model> …,
+  answering through Claude in Chrome, a browser agent.` instead: the model drives
+  a browser there, not a terminal. The client is fixed per conversation, so the
+  cache is unaffected.
 
 ### 4a. Claude Code request shapes a translator must handle (measured 2026-09-13, CLI 2.1.266)
 

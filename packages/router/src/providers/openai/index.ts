@@ -6,6 +6,7 @@ import http from "node:http";
 import type { OpenAiCompatibleProvider } from "../../config.ts";
 import type { Logger } from "../../log.ts";
 import type { RequestUsage } from "../../requestlog.ts";
+import type { IdentitySurface } from "../../identity.ts";
 import { exhaustionHeaders, modelDeprecation, providerExhaustion, type ModelUnavailable, type ProviderExhaustion } from "../../health.ts";
 import { retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
@@ -149,8 +150,11 @@ export class OpenAiCompatibleAdapter {
     if (this.lastInputByKey.size > 500) this.lastInputByKey.delete(this.lastInputByKey.keys().next().value!);
   }
 
-  /** Handle a fully-read Messages request. Model/effort have already been resolved by routing. */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, credential?: OpenAiCredential): Promise<OpenAiOutcome> {
+  /**
+   * Handle a fully-read Messages request. Model/effort have already been resolved by routing.
+   * `surface` names the client in the identity line (identity.ts).
+   */
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, credential?: OpenAiCredential, surface?: IdentitySurface): Promise<OpenAiOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) }).end(body);
@@ -186,6 +190,7 @@ export class OpenAiCompatibleAdapter {
       carried,
       log: (line) => this.log.info(`${this.tag} ${this.name}: ${line} (${model})`),
       ...(this.cfg.identity === undefined ? {} : { identity: this.cfg.identity }),
+      ...(surface ? { surface } : {}),
       ...(this.cfg.instructionsAppend ? { instructionsAppend: this.cfg.instructionsAppend } : {}),
     });
     const upstreamRequest = translate();

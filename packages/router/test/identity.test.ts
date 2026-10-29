@@ -38,3 +38,13 @@ test("a system shape we did not build is not rewritten", () => {
   applyIdentityToAnthropicBody(json, { model: "m" });
   assert.deepEqual(json.system, { unexpected: true });
 });
+
+test("Claude in Chrome's own turns are told they answer through a browser agent", () => {
+  assert.equal(identityLine("gpt-6.1-sol", "high", "claude-in-chrome"), "You are gpt-6.1-sol (reasoning effort: high), answering through Claude in Chrome, a browser agent.");
+  assert.equal(identityLine("gpt-6.1-sol", undefined, "claude-code"), identityLine("gpt-6.1-sol"), "Claude Code stays the default");
+  assert.equal(identityPrefix({ model: "m", surface: "claude-in-chrome" }), "You are m, answering through Claude in Chrome, a browser agent.");
+  assert.equal(identityPrefix({ model: "m", identity: false, surface: "claude-in-chrome" }), null, "a provider that turned identity off says nothing for the extension either");
+  const json: Record<string, unknown> = { model: "x", system: [{ type: "text", text: "You are Claude, in a browser.", cache_control: { type: "ephemeral" } }] };
+  applyIdentityToAnthropicBody(json, { model: "m", surface: "claude-in-chrome" });
+  assert.deepEqual(json.system, [{ type: "text", text: "You are m, answering through Claude in Chrome, a browser agent." }, { type: "text", text: "You are Claude, in a browser.", cache_control: { type: "ephemeral" } }]);
+});

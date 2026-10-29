@@ -3319,3 +3319,36 @@ test("GET /api/limits assembles every readable provider and honours limits:false
     ] : [],
   });
 });
+
+test("GET /chrome.pac serves the proxy script for Claude in Chrome on a loopback Host only", async () => {
+  const cfg = makeCfg({ listen: { host: "127.0.0.1", port: 8790 } });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-chrome-pac-admin-"));
+  const configFile = path.join(home, "config.json");
+  fs.writeFileSync(configFile, JSON.stringify(cfg));
+  const admin = await startAdmin({
+    config: () => cfg,
+    configFile,
+    log: new Logger(null, 1_000_000, 1, false),
+    stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
+    health: () => 0,
+    version: "0.0.0-test",
+    requests: new RequestLog(path.join(home, "logs", "requests.jsonl")),
+  });
+  try {
+    const res = await fetch(`${base()}:${admin.port}/chrome.pac`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "application/x-ns-proxy-autoconfig");
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    const pac = await res.text();
+    assert.match(pac, /return "PROXY 127\.0\.0\.1:8790; DIRECT";/);
+    // A rebinding page names some other Host; it gets nothing.
+    const rebound = await new Promise<number>((resolve, reject) => {
+      const req = http.get({ host: "127.0.0.1", port: admin.port, path: "/chrome.pac", headers: { host: "evil.example" } }, (r) => { r.resume(); resolve(r.statusCode ?? 0); });
+      req.on("error", reject);
+    });
+    assert.equal(rebound, 403);
+  } finally {
+    admin.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

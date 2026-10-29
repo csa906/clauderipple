@@ -10,6 +10,7 @@
 
 import type http from "node:http";
 import type { GrokProvider, OpenAiCompatibleProvider } from "../../config.ts";
+import type { IdentitySurface } from "../../identity.ts";
 import type { Logger } from "../../log.ts";
 import type { AnthropicRequest } from "../chatgpt/translate.ts";
 import { OpenAiCompatibleAdapter, type OpenAiOutcome } from "../openai/index.ts";
@@ -94,7 +95,7 @@ export class GrokAdapter {
     }).catch(() => []);
   }
 
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined): Promise<OpenAiOutcome> {
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, surface?: IdentitySurface): Promise<OpenAiOutcome> {
     // Counting tokens is answered locally and needs no session.
     if (!path.startsWith("/v1/messages/count_tokens")) {
       // The wait can be a 30s CLI refresh. A client that leaves meanwhile has cancelled the turn, and
@@ -115,6 +116,6 @@ export class GrokAdapter {
       }
       if (closed) return { status: 0, bytes: 0, note: "client closed" };
     }
-    return this.inner.handle(req, res, path, json, model, effort);
+    return this.inner.handle(req, res, path, json, model, effort, undefined, surface);
   }
 }

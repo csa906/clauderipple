@@ -35,6 +35,8 @@ export type RequestRecord = {
   upstreamCalled?: false;
   refusal?: "thread-continue" | "drain" | "unroutable" | "no-account" | "unknown-provider" | "web-search-unsupported" | "prompt-incompatible";
   purpose?: "auto-mode-classifier" | "web-search" | "web-fetch";
+  /** Set for a request from a browser (chrome-extension.ts): Claude in Chrome itself, or any other context. Absent for Claude Code. */
+  client?: "chrome-extension" | "browser";
   requestedTier?: string;
   servedTier?: string;
   stopReason?: string;

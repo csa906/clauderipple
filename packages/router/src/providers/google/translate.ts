@@ -14,7 +14,7 @@
 import crypto from "node:crypto";
 import { clampEffort } from "../../compat.ts";
 import { documentFile, documentText, estimateTokens, normalizeSchema, serverToolNames, systemWithDroppedToolNote, toolNameForResponses, type AnthropicBlock, type AnthropicRequest, type AnthropicTool } from "../chatgpt/translate.ts";
-import { identityPrefix, instructionsSuffix } from "../../identity.ts";
+import { identityPrefix, instructionsSuffix, type IdentitySurface } from "../../identity.ts";
 
 // ---- Gemini wire -------------------------------------------------------------------
 
@@ -72,6 +72,8 @@ export type GoogleTranslateOptions = {
   caps?: GoogleEffortCaps;
   /** Prefix the system prompt with what the model is. Default true; see identity.ts. */
   identity?: boolean;
+  /** Which client the identity line names. Default Claude Code. */
+  surface?: IdentitySurface;
   /** Fixed configured text after the system prompt. */
   instructionsAppend?: string;
   /** Signed thought signatures by Anthropic tool_use id, re-attached to their functionCall parts. */
@@ -210,7 +212,7 @@ function thinkingConfigFor(model: string, effort: string | undefined): GeminiGen
 
 /** The system text this provider should see: what it is, the caller's prompt, the configured addendum. */
 function systemForGoogle(sys: string, opts: GoogleTranslateOptions): string {
-  return [identityPrefix({ model: opts.model, effort: namedEffort(opts), identity: opts.identity }), sys, instructionsSuffix({ model: opts.model, instructionsAppend: opts.instructionsAppend })]
+  return [identityPrefix({ model: opts.model, effort: namedEffort(opts), identity: opts.identity, surface: opts.surface }), sys, instructionsSuffix({ model: opts.model, instructionsAppend: opts.instructionsAppend })]
     .filter(Boolean)
     .join("\n\n");
 }

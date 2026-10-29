@@ -291,3 +291,8 @@ test("Gemini receives text documents, content blocks, PDF bytes and unsupported-
   ]);
   assert.match(out.contents[0]!.parts[3]!.text!, /문서.*전달하지 못했습니다/);
 });
+
+test("an extension turn's system instruction names Claude in Chrome", () => {
+  const out = toGeminiRequest(request, { model: "gemini-3-pro-preview", effort: "high", surface: "claude-in-chrome" });
+  assert.equal(out.systemInstruction?.parts[0]?.text, "You are gemini-3-pro-preview (reasoning effort: high), answering through Claude in Chrome, a browser agent.\n\nYou are a coding agent.");
+});

@@ -459,7 +459,7 @@ node packages/cli/src/index.ts ui        # open the local GUI in your browser
 
 `uninstall` reverses everything and restores `~/.claude/settings.json` from a backup.
 Other commands: `status`, `start`, `stop`, `restart`, `logs -f`, `login`, `logout`,
-`claude-login`, `claude-logout`, `picker on|off`, `agent-title on|off`, `mod on|off`,
+`claude-login`, `claude-logout`, `picker on|off`, `chrome on|off`, `agent-title on|off`, `mod on|off`,
 `codex on|off`, `update`, `image "<prompt>"`.
 </details>
 
@@ -575,6 +575,29 @@ while this machine's Claude Desktop is connected to it anyway. The tunnel
 listens on the host's loopback only, but on a shared host every user there can
 reach that port, and through it your router. The status mod and image
 generation are not available on remote hosts yet.
+
+### Claude in Chrome (optional)
+
+Claude in Chrome's own side-panel chat keeps its own model menu. To list your
+picker models there too:
+
+```bash
+clauderipple chrome on      # trusts the CA if needed, then prints how to start Chrome
+clauderipple chrome off     # the menu is the extension's own again within five minutes
+```
+
+The extension cannot be pointed at another server, so Chrome reaches
+ClaudeRipple through a proxy script (`http://127.0.0.1:8791/chrome.pac`) that
+sends `api.anthropic.com` to the router and every other site direct. Start
+Chrome with `--proxy-pac-url=<that URL>`, preferably with a `--user-data-dir` of
+its own (the command prints the line), install the extension there and sign in.
+Your models then appear after Claude's. A model you pick receives the page text
+and screenshots the extension sends. The extension's own Claude models keep its
+own sign-in and never use ClaudeRipple's Claude accounts. If the side panel
+shows claude.ai's own view (the hosted panel, which the extension can switch to
+once you allow browser control), your models do not appear: that panel runs on
+claude.ai's servers. Driving Chrome from Claude Code or the Code tab already
+uses the model you picked there and needs none of this.
 
 ## Lid closed and the phone hotspot
 

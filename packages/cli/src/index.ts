@@ -23,7 +23,8 @@ import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
 import { applyAppProxy, caTrusted, CA_NAME, currentAppProxy, migrateLegacyAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
-import { removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
+import { removeClientIntegrations, setChromeExtensionEnabled, setPickerEnabled } from "./integrations.ts";
+import { chromeOnInstructions } from "./chrome.ts";
 import { withCommandHelp } from "./help-gate.ts";
 import { runtime } from "./runtime.ts";
 import { codexOff, codexOn, ingressPort } from "./codex.ts";
@@ -66,6 +67,36 @@ async function pickerOn(): Promise<void> {
   console.log("Then open the Code tab picker: entries from cli.extraModels should be there. `clauderipple status` shows the last injection.");
 }
 
+/** `clauderipple chrome on` (chrome.ts): trust the CA if needed, flip the switch, say how to start Chrome. */
+function chromeOn(): void {
+  const home = homeDir();
+  const cfg = new ConfigStore(configPath()).get();
+  const caPem = certPaths(home).caPem;
+  if (!fs.existsSync(path.join(home, "ca.key"))) throw new Error("ca.key missing; run `clauderipple install` first");
+  console.log("Claude in Chrome lists your picker models in its own model menu once its API calls go through ClaudeRipple.");
+  if (!caTrusted(caPem)) {
+    console.log(
+      isWindows
+        ? "Trusting the ClaudeRipple CA for your Windows user account, which Chrome reads. Windows will show a confirmation dialog with the certificate fingerprint — answer Yes."
+        : isLinux
+          ? `Trusting the ClaudeRipple CA in your NSS database (${nssDb()}), which Chrome reads. Your user only; no password, no sudo.`
+          : "Trusting the ClaudeRipple CA in your login keychain, which Chrome reads. macOS will ask for your password (ClaudeRipple never sees it).",
+    );
+    trustCa(caPem);
+    if (!caTrusted(caPem)) throw new Error("CA is not trusted; chromeExtension not enabled");
+  }
+  console.log("✓ CA trusted (current user only)");
+  setChromeExtensionEnabled(true);
+  console.log("✓ chromeExtension.enabled = true (the router picks it up live; no restart)");
+  for (const line of chromeOnInstructions(process.platform, home, adminPort(cfg))) console.log(line);
+}
+
+function chromeOff(): void {
+  setChromeExtensionEnabled(false);
+  console.log("✓ chromeExtension.enabled = false: the extension's menu is its own again once its five-minute cache expires, and its turns pass through untouched.");
+  console.log("Chrome keeps sending api.anthropic.com through ClaudeRipple while it runs with --proxy-pac-url, so the CA stays trusted; start Chrome without the switch to stop that.");
+}
+
 /** After a direct start: `repair` fixes the entry but leaves a router that answers alone (doctor.ts),
  * so it is the restart afterwards that puts the router back under its supervisor (checked on
  * Windows 11, 2026-10-23). */
@@ -101,6 +132,13 @@ function pickerOff(): void {
   console.log(removed ? "✓ Claude Desktop config library entry removed (previous entry restored if there was one)" : "✓ no ClaudeRipple config library entry");
   setPickerEnabled(false);
   console.log("✓ picker.enabled = false");
+  // Claude in Chrome reaches the router through the same CA (`chrome on`): removing it would fail every
+  // TLS handshake Chrome makes to api.anthropic.com, its own Claude turns included.
+  if (new ConfigStore(configPath()).get().chromeExtension?.enabled) {
+    console.log("! CA kept: Claude in Chrome still uses it (`clauderipple chrome off`, then quit Chrome, then `picker off` again removes it).");
+    console.log("\nQuit and reopen Claude Desktop to apply.");
+    return;
+  }
   if (isWindows) console.log("Removing the CA: Windows will ask you to confirm once more.");
   const store = isWindows ? "your user certificate store" : isLinux ? `your NSS database (${nssDb()})` : "the login keychain";
   const removal = untrustCa(certPaths(home).caPem, { sweep: false, missingCaTrustRemoved: flag("confirm-missing-ca-trust-removed") });
@@ -720,6 +758,7 @@ function help(): void {
   image "<prompt>" [-o FILE] [--aspect square|landscape|portrait] [--transparent] [--ref FILE ...]
                     generate an image with your ChatGPT subscription and print the file's path
   picker on|off     show your mapped models by name in the Claude Desktop picker (trusts the CA in your login keychain, routes the app through ClaudeRipple)
+  chrome on|off     list your picker models in Claude in Chrome's own model menu (trusts the CA; prints how to start Chrome with the proxy script)
   codex on|off      add/remove ClaudeRipple's local OpenAI provider and selection profile for Codex CLI
   agent-title on|off|status
                     prefix subagent titles with the real model and thinking depth ("Terra·high · …") via a Claude Code hook
@@ -826,6 +865,13 @@ async function dispatchCommand(): Promise<void> {
       if (sub === "on") await pickerOn();
       else if (sub === "off") pickerOff();
       else console.log("usage: clauderipple picker on|off");
+      break;
+    }
+    case "chrome": {
+      const sub = args[1];
+      if (sub === "on") chromeOn();
+      else if (sub === "off") chromeOff();
+      else console.log("usage: clauderipple chrome on|off");
       break;
     }
     case "codex": {

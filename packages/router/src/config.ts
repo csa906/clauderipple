@@ -532,6 +532,13 @@ export type Config = {
    */
   picker?: { enabled: boolean; hosts?: string[] };
   /**
+   * Claude in Chrome: list the picker models (`cli.extraModels` on a non-Anthropic provider) in the
+   * extension's own model menu and route the extension's turns on them. Off unless set. The
+   * extension reaches the router only through a PAC (GET /chrome.pac on the admin port) that sends
+   * api.anthropic.com here; `clauderipple chrome on` says how (chrome-extension.ts).
+   */
+  chromeExtension?: { enabled: boolean };
+  /**
    * Remote (SSH) hosts that run Claude Code for Claude Desktop sessions. The router holds a reverse
    * tunnel to each (remote-tunnel.ts), so the remote's 127.0.0.1:<port> reaches this proxy. Written
    * by `clauderipple remote add|remove`, which also sets up the remote side (remote-host.ts).
@@ -661,6 +668,7 @@ function merge(base: Config, over: Partial<Config>): Config {
     effortClamp: { ...base.effortClamp, ...(over.effortClamp ?? {}) },
     ...((over.admin ?? base.admin) ? { admin: over.admin ?? base.admin! } : {}),
     ...(over.picker ? { picker: { ...over.picker } } : {}),
+    ...(over.chromeExtension ? { chromeExtension: { ...over.chromeExtension } } : {}),
   };
 }
 
@@ -996,6 +1004,11 @@ export function validate(c: Config): string[] {
         if (portError) errors.push(`remote.hosts ${i}: ${portError}`);
       });
     }
+  }
+  if (c.chromeExtension !== undefined) {
+    const x = c.chromeExtension as Record<string, unknown> | null;
+    if (!x || typeof x !== "object" || Array.isArray(x)) errors.push("chromeExtension must be an object");
+    else if (typeof x.enabled !== "boolean") errors.push("chromeExtension.enabled must be true or false");
   }
   validatePower(c, errors);
   return errors;

@@ -13,6 +13,7 @@ import { looksLikeAuth } from "../openai/index.ts";
 import { StreamMapper, conversationKey, estimateTokens, formatSse, serverToolNames, toResponsesRequest, toolNameRestoreMap, type AnthropicRequest, type TranslateOptions } from "./translate.ts";
 import { refusesReplayedReasoning } from "../../reasoning.ts";
 import type { RequestUsage } from "../../requestlog.ts";
+import type { IdentitySurface } from "../../identity.ts";
 import { exhaustionHeaders, providerExhaustion, type ProviderExhaustion } from "../../health.ts";
 import type { SearchBackend, SearchHit, SearchOutcome, WebSearchQuery } from "../../websearch.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
@@ -1025,11 +1026,12 @@ export class ChatGptAdapter {
    * `subagent` is the one bit about the caller the tier needs: Claude Code names the agent in the
    * `x-claude-code-agent-id` header, and only a subagent's request carries it.
    */
-  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true, subagent = false, imageHint?: string): TranslateOptions {
+  private responsesOptions(carried: { replayed: number; undecodable: number }, model: string, effort: string | undefined, replay = true, subagent = false, imageHint?: string, surface?: IdentitySurface): TranslateOptions {
     return {
       model,
       effort: effort ?? this.cfg.defaultEffort ?? "high",
       identity: this.cfg.identity ?? true,
+      ...(surface ? { surface } : {}),
       ...(this.cfg.instructionsAppend ? { instructionsAppend: this.cfg.instructionsAppend } : {}),
       ...(imageHint ? { imageHint } : {}),
       replay,
@@ -1050,8 +1052,9 @@ export class ChatGptAdapter {
    *
    * `options.subagent` says the turn was made inside a subagent, which is what the provider's
    * `fast.subagent` switch is about. `options.imageHint` is how the session makes an image (translate.ts).
+   * `options.surface` names the client in the identity line (identity.ts).
    */
-  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, options?: { subagent?: boolean; imageHint?: string }): Promise<ChatGptOutcome> {
+  async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, options?: { subagent?: boolean; imageHint?: string; surface?: IdentitySurface }): Promise<ChatGptOutcome> {
     if (path.startsWith("/v1/messages/count_tokens")) {
       const body = JSON.stringify({ input_tokens: estimateTokens(json) });
       res.writeHead(200, { "content-type": "application/json", "content-length": String(body.length) }).end(body);
@@ -1065,7 +1068,7 @@ export class ChatGptAdapter {
 
     const carried = { replayed: 0, undecodable: 0 };
     const subagent = options?.subagent === true;
-    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort, true, subagent, options?.imageHint));
+    let upstreamReq = toResponsesRequest(json, this.responsesOptions(carried, model, effort, true, subagent, options?.imageHint, options?.surface));
     let body = JSON.stringify(upstreamReq);
     const cacheKey = upstreamReq.prompt_cache_key;
     // Input estimate for message_start: a conversation only grows, so the last measured total is a floor.
@@ -1107,7 +1110,7 @@ export class ChatGptAdapter {
     // must never be the reason a user's turn fails (reasoning.ts).
     if (carried.replayed > 0 && sent.kind === "refused" && refusesReplayedReasoning(sent.status, sent.text)) {
       this.log.warn(`chatgpt ${this.name}: upstream ${sent.status} refused ${carried.replayed} replayed reasoning item(s) for ${model}; asking again without them: ${sent.text.slice(0, 200)}`);
-      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false, subagent, options?.imageHint));
+      upstreamReq = toResponsesRequest(json, this.responsesOptions({ replayed: 0, undecodable: 0 }, model, effort, false, subagent, options?.imageHint, options?.surface));
       body = JSON.stringify(upstreamReq);
       carried.replayed = 0;
       sent = await ask();

@@ -573,3 +573,9 @@ test("schema literals under const, enum, default and examples are not scrubbed",
   assert.deepEqual(out.properties.value, { const: data, enum: [data], default: data, examples: [data] });
   assert.deepEqual(schema, before);
 });
+
+test("an extension turn's instructions name Claude in Chrome, not Claude Code", () => {
+  const r = toResponsesRequest(turn1, { ...opts, surface: "claude-in-chrome" });
+  assert.ok(r.instructions.startsWith("You are gpt-5.6-terra (reasoning effort: high), answering through Claude in Chrome, a browser agent."), r.instructions.slice(0, 120));
+  assert.ok(!r.instructions.includes("terminal-based coding agent"));
+});

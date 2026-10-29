@@ -394,7 +394,7 @@ node packages/cli/src/index.ts ui        # 브라우저에서 로컬 GUI 열기
 ```
 
 `uninstall`은 전부 되돌리고 `~/.claude/settings.json`을 백업에서 복원합니다. 그 밖의 명령: `status`, `start`, `stop`,
-`restart`, `logs -f`, `login`, `logout`, `claude-login`, `claude-logout`, `picker on|off`, `agent-title on|off`, `mod on|off`,
+`restart`, `logs -f`, `login`, `logout`, `claude-login`, `claude-logout`, `picker on|off`, `chrome on|off`, `agent-title on|off`, `mod on|off`,
 `codex on|off`, `update`, `image "<프롬프트>"`.
 </details>
 
@@ -464,6 +464,23 @@ Anthropic 한도를 쓰지 않게 하려면 `config.json`에서 같은 ChatGPT �
 ```
 
 명시해야만 켜집니다. `webSearch` 설정이 없으면 Claude Code의 기존 검색 경로는 바뀌지 않습니다.
+
+### Claude in Chrome (선택)
+
+Claude in Chrome의 사이드패널 채팅은 모델 메뉴를 따로 가지고 있습니다. 그 메뉴에도 피커 모델을 보이게 하려면:
+
+```bash
+clauderipple chrome on      # 필요하면 CA를 신뢰시키고, Chrome 실행 방법을 출력합니다
+clauderipple chrome off     # 5분 안에 확장 원래 메뉴로 돌아갑니다
+```
+
+확장은 다른 서버를 가리키게 할 수 없어서, Chrome이 프록시 스크립트(`http://127.0.0.1:8791/chrome.pac`)를 통해
+ClaudeRipple에 닿습니다. 이 스크립트는 `api.anthropic.com`만 라우터로 보내고 다른 사이트는 모두 직접 연결합니다.
+Chrome을 `--proxy-pac-url=<그 URL>`로 실행하되, 되도록 전용 `--user-data-dir`을 함께 쓰세요(명령이 실행 줄을 출력합니다).
+그 프로필에 확장을 설치하고 로그인하면 Claude 모델 뒤에 피커 모델이 나타납니다. 고른 모델은 확장이 보내는 페이지
+텍스트와 스크린샷을 받습니다. 확장의 Claude 모델은 확장 자신의 로그인을 그대로 쓰고 ClaudeRipple의 Claude 계정을
+쓰지 않습니다. 사이드패널이 claude.ai 자체 화면(브라우저 제어를 허용하면 전환될 수 있는 호스팅 패널)을 보여 주면
+피커 모델은 나타나지 않습니다. 그 패널은 claude.ai 서버에서 돌기 때문입니다. Claude Code나 Code 탭에서 Chrome을 조작할 때는 이미 그쪽에서 고른 모델을 쓰므로 이 설정이 필요 없습니다.
 
 ### Codex 앱과 Codex CLI
 

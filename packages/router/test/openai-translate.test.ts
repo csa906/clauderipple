@@ -724,3 +724,10 @@ test("documents reach both OpenAI wires as text, native PDF files or an unsuppor
   ]);
   assert.match(content[3]!.text!, /문서.*전달하지 못했습니다/);
 });
+
+test("an extension turn's system message names Claude in Chrome on both wires", () => {
+  const chat = toOpenAiRequest(request, { ...options, wire: "chat", surface: "claude-in-chrome" }) as ChatRequest;
+  assert.equal(chat.messages[0]?.content, "You are grok (reasoning effort: high), answering through Claude in Chrome, a browser agent.\n\nYou are a coding agent.");
+  const responses = toOpenAiRequest(request, { ...options, wire: "responses", surface: "claude-in-chrome" }) as ResponsesRequest;
+  assert.equal(responses.instructions, "You are grok (reasoning effort: high), answering through Claude in Chrome, a browser agent.\n\nYou are a coding agent.");
+});

@@ -43,6 +43,7 @@ import { billingOf, claudeChoices, fillLadder, ladderNeedsFill } from "../../mod
 import { normalizeSettings, twoLevelRungs } from "../../mod/hooks/settings.ts";
 import type { Billing, DomainRules, Effort, LadderChoice, Rungs, Settings, Step } from "../../mod/types/index.d.ts";
 import { chatPickerModels } from "./picker.ts";
+import { chromePac } from "./chrome-extension.ts";
 import { declaredBy, resolve } from "./routing.ts";
 import type { Logger } from "./log.ts";
 import { CredentialPool } from "./pool.ts";
@@ -2001,6 +2002,14 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       if (method !== "GET" && crossSiteOrigin(req)) {
         deps.log.warn(`admin: refused ${method} ${pathname} from origin ${String(req.headers.origin)}`);
         sendJson(res, 403, { error: "cross-site request refused" });
+        return;
+      }
+      // Chrome's proxy script for Claude in Chrome (chrome-extension.ts). It names only the proxy's
+      // own address, so it is served whatever `chromeExtension` says.
+      if (pathname === "/chrome.pac" && method === "GET") {
+        const pac = chromePac(deps.config());
+        res.writeHead(200, { "content-type": "application/x-ns-proxy-autoconfig", "cache-control": "no-store", "content-length": String(Buffer.byteLength(pac)) });
+        res.end(pac);
         return;
       }
       if (pathname === "/api/settings-jobs" || pathname === "/api/settings-jobs/claim" || pathname === "/api/settings-jobs/result") {

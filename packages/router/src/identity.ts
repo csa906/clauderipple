@@ -7,23 +7,34 @@
 // identity depends on the model and the effort only, both fixed for a route, and the addendum is
 // configuration. Changing either costs one cache miss.
 
+/**
+ * The client a routed turn came from. Claude Code is every turn but one kind: Claude in Chrome's own
+ * side-panel chat (chrome-extension.ts), whose model drives a browser and must not be told it is a
+ * terminal coding agent. Fixed per conversation, like the model and the effort.
+ */
+export type IdentitySurface = "claude-code" | "claude-in-chrome";
+
 export type IdentityOptions = {
   model: string;
   effort?: string | undefined;
   /** Default true: the caller passes the provider's `identity` field as given. */
   identity?: boolean | undefined;
   instructionsAppend?: string | undefined;
+  /** Default "claude-code". */
+  surface?: IdentitySurface | undefined;
 };
 
 /** The sentence put in front of the system prompt. Effort is named because a model cannot see its own setting. */
-export function identityLine(model: string, effort?: string): string {
+export function identityLine(model: string, effort?: string, surface: IdentitySurface = "claude-code"): string {
   const reasoning = effort ? ` (reasoning effort: ${effort})` : "";
-  return `You are ${model}${reasoning}, answering through Claude Code, a terminal-based coding agent.`;
+  return surface === "claude-in-chrome"
+    ? `You are ${model}${reasoning}, answering through Claude in Chrome, a browser agent.`
+    : `You are ${model}${reasoning}, answering through Claude Code, a terminal-based coding agent.`;
 }
 
 /** The identity line, when enabled, in the order it belongs: before the caller's own system text. */
 export function identityPrefix(opts: IdentityOptions): string | null {
-  return (opts.identity ?? true) ? identityLine(opts.model, opts.effort) : null;
+  return (opts.identity ?? true) ? identityLine(opts.model, opts.effort, opts.surface) : null;
 }
 
 /** The configured addendum, trimmed, or null when there is none to add. */

@@ -63,11 +63,20 @@ function listenPort(home: string): number | undefined {
  * permissions survive, and a crash never leaves half a config behind (G-D04, 2026-10-25).
  */
 export function setPickerEnabled(enabled: boolean, file = configPath()): void {
+  setEnabledFlag("picker", enabled, file);
+}
+
+/** Flip `chromeExtension.enabled` in config.json, the same way as `picker.enabled`. */
+export function setChromeExtensionEnabled(enabled: boolean, file = configPath()): void {
+  setEnabledFlag("chromeExtension", enabled, file);
+}
+
+function setEnabledFlag(key: "picker" | "chromeExtension", enabled: boolean, file: string): void {
   withFileLock(file, () => {
     const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${file} is not a JSON object; left untouched`);
     const next = { ...(raw as Record<string, unknown>) };
-    next.picker = { ...((next.picker as Record<string, unknown> | undefined) ?? {}), enabled };
+    next[key] = { ...((next[key] as Record<string, unknown> | undefined) ?? {}), enabled };
     let mode: number | null = null;
     try {
       mode = fs.statSync(file).mode & 0o777;

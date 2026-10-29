@@ -22,7 +22,7 @@ export function isBootstrapPath(path: string): boolean {
   return BOOTSTRAP_PATHS.some((p) => path === p || path.startsWith(p + "/") || path.startsWith(p + "?"));
 }
 
-type ModelEntry = Record<string, unknown> & { id?: string };
+export type ModelEntry = Record<string, unknown> & { id?: string };
 type Surface = Record<string, unknown> & { id?: string; models?: ModelEntry[] };
 
 // Surfaces whose sessions run through the Claude Code CLI (and therefore through the router).
@@ -34,7 +34,7 @@ function isClaudeEntry(m: ModelEntry): boolean {
   return typeof m.id === "string" && m.id.startsWith("claude-");
 }
 
-function pickTemplate(models: ModelEntry[]): ModelEntry | null {
+export function pickTemplate(models: ModelEntry[]): ModelEntry | null {
   return models.find((m) => isClaudeEntry(m) && !m.disabled && m.section !== "deprecated" && m.section !== "legacy") ?? models.find(isClaudeEntry) ?? null;
 }
 
@@ -50,7 +50,7 @@ function pickTemplate(models: ModelEntry[]): ModelEntry | null {
  * it: when the selected level is not on the list, the app switches to the recommended one (`uw`).
  * A model that takes none of them gets no `thinking` at all, which the app reads as "no effort".
  */
-function narrowThinking(entry: ModelEntry, levels: string[]): void {
+export function narrowThinking(entry: ModelEntry, levels: string[]): void {
   const thinking = entry.thinking as { effort_options?: { id?: unknown; recommended?: unknown }[] } | undefined;
   if (!thinking || !Array.isArray(thinking.effort_options)) return;
   const kept = thinking.effort_options.filter((option) => typeof option.id === "string" && levels.includes(option.id));

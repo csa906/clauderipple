@@ -32,7 +32,8 @@ import { readModRoutingSettings } from "./mod-settings.ts";
 import { THREAD_UNSUPPORTED, continuesTranslatedTurn, effortOf, isAutoModeClassifier, resolve, rewriteBody, stripThreadFields, threadDecision, unroutableReason, type Resolved } from "./routing.ts";
 import { defaultAgentDir, imageLine, withAgentAliases } from "./agents.ts";
 import { forwardCompatibleHeader, resolveCompatibleCaps, sanitizeForCompatible } from "./compat.ts";
-import { applyIdentityToAnthropicBody } from "./identity.ts";
+import { applyIdentityToAnthropicBody, type IdentitySurface } from "./identity.ts";
+import { chromeEditFor, chromeExtensionEnabled, chromeExtensionModels, chromeExtensionRoute, injectChromeFeatures, injectChromeSelector, isChromeListRequest, requestClient } from "./chrome-extension.ts";
 import { anthropicServerToolBackend, webPluginBackend, webSearchBlocks, webSearchErrorBlocks, webSearchMessage, webSearchQuery, webSearchSse, type WebSearchQuery } from "./websearch.ts";
 import { classify, CredentialPool, retryAfterMs, type Credential } from "./pool.ts";
 import { PRESETS } from "./presets.ts";
@@ -825,6 +826,15 @@ export class Proxy {
     const agentId = req.headers["x-claude-code-agent-id"];
     const subagent = typeof agentId === "string" && agentId.length > 0;
     if (subagent) record.subagent = true;
+    // A browser's request (chrome-extension.ts) is never a Claude Code turn, whatever it carries: the
+    // PAC that lets Claude in Chrome reach the router sends every page of that profile here too. Only
+    // the extension's own turns may be routed; any other browser request passes through as it came.
+    const client = requestClient(req.headers);
+    const fromBrowser = client !== null;
+    const fromChrome = client === "claude-in-chrome";
+    if (client) record.client = fromChrome ? "chrome-extension" : "browser";
+    /** Who the identity line tells a routed model it answers through (identity.ts). */
+    const surface: IdentitySurface | undefined = fromChrome ? "claude-in-chrome" : undefined;
     let observedUsage: RequestUsage | undefined;
     let observedStopReason: string | undefined;
     // Set once a Google turn came back unwritten (a prompt refusal or no model capacity), which allows
@@ -958,7 +968,8 @@ export class Proxy {
       const states = this.pool.report(name, credentials).map((row, i) => `${this.credentialLabel(name, credentials[i]!, credentials)}:${row.paused ? "paused" : row.state}`).join(", ");
       log.info(`KEY ${name} credential=${record.credential} conversation=${affinity ?? "-"} reason=${reason} candidates=[${states}]`);
     };
-    const search = json && isApiHost && pathname === "/v1/messages" ? webSearchQuery(json) : null;
+    // WebSearch and WebFetch side requests are Claude Code's; a browser's get neither.
+    const search = json && isApiHost && pathname === "/v1/messages" && !fromBrowser ? webSearchQuery(json) : null;
     let searchAttempted = false;
     const markSearchAttempted = (): void => { searchAttempted = true; };
     if (search && cfg.webSearch) {
@@ -968,7 +979,7 @@ export class Proxy {
       // returns nothing is worse than one that costs what it always cost.
     }
 
-    const webFetch = !!(cfg.webSearch && json && pathname === "/v1/messages" && isWebFetchRequest(json));
+    const webFetch = !!(cfg.webSearch && json && pathname === "/v1/messages" && !fromBrowser && isWebFetchRequest(json));
     let fetchRoute: Resolved | null = null;
     if (webFetch) record.purpose = "web-fetch";
     if (webFetch && cfg.webSearch) {
@@ -1019,8 +1030,10 @@ export class Proxy {
         delete output.effort;
         json.output_config = output;
       }
-      let resolved = fetchTarget ?? (json ? resolve(model, json, cfg) : null);
-      if (!fetchTarget && subagent && resolved && json) {
+      // An extension turn is routed only on an id its menu was given, and never by what its body says;
+      // no other browser request is routed at all.
+      let resolved = fetchTarget ?? (json ? (fromBrowser ? (fromChrome ? chromeExtensionRoute(model, cfg) : null) : resolve(model, json, cfg)) : null);
+      if (!fetchTarget && subagent && !fromBrowser && resolved && json) {
         resolved = this.workerFallbacks(resolved, json, cfg, typeof model === "string" ? model : "", record.session && `${record.session}:${agentId}`);
       }
 
@@ -1029,7 +1042,21 @@ export class Proxy {
       // "the model vanished" (2026-09-20: an agent file named `deepseek` resolved, through a missing
       // alias, to a model no provider declared — thirty of them came back 404). A native `claude-*`
       // id is deliberately unrouted and must keep passing through (§5).
-      if (!resolved && isApiHost && isMessages && json && typeof model === "string") {
+      //
+      // The extension's own turn is judged by its menu alone: a non-Claude id it was not offered (the
+      // feature off, or the model gone from the picker while the extension's five-minute cache still
+      // lists it) is refused rather than sent to Anthropic, and a Claude id always passes through —
+      // the marker check below reads the body, which for the extension is page content.
+      if (fromChrome && !resolved && isApiHost && isMessages && json && typeof model === "string" && !model.startsWith("claude-")) {
+        const reason = `"${model}" is not offered to Claude in Chrome${chromeExtensionEnabled(cfg) ? "" : " (chromeExtension is off)"}`;
+        const payload = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `ClaudeRipple: ${reason}` } });
+        res.writeHead(400, { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) }).end(payload);
+        tag = `REFUSE ${model}`;
+        record = { ...record, provider: "refused" };
+        finish("400", payload.length, `ClaudeRipple: ${reason}`, true, { upstreamCalled: false, refusal: "unroutable" });
+        return;
+      }
+      if (!fromBrowser && !resolved && isApiHost && isMessages && json && typeof model === "string") {
         const reason = unroutableReason(model, json, cfg);
         if (reason) {
           const payload = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `ClaudeRipple: ${reason}` } });
@@ -1070,7 +1097,8 @@ export class Proxy {
 
       // Only a real, un-routed Claude Code Messages request may refresh this RAM-only source.
       // Do not inspect it elsewhere: it must never enter logs, RequestLog, picker diagnostics, or admin data.
-      if (isApiHost && pathname === "/v1/messages" && !route) this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
+      // A browser's sign-in (the extension's own OAuth client, or whatever a page sent) is never Claude Code's.
+      if (isApiHost && pathname === "/v1/messages" && !route && !fromBrowser) this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
 
       // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
       // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
@@ -1128,6 +1156,17 @@ export class Proxy {
           // several protocols is one provider, and this is where the model's own shape is folded in so
           // the branches below pick the adapter it actually needs.
           const provider = providerFor(configured, route.model);
+          // This router's Claude accounts are Claude Code's. chromeExtensionRoute drops a slot's fallbacks
+          // onto them; checked here as well, on the first target and on every fallback the loop takes.
+          if (fromBrowser && provider.type === "anthropic") {
+            const reason = `"${String(model)}" reached ${route.provider}, which serves Claude Code only`;
+            const payload = JSON.stringify({ type: "error", error: { type: "overloaded_error", message: `ClaudeRipple: ${reason}` } });
+            res.writeHead(503, { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) }).end(payload);
+            tag = `REFUSE ${String(model)}`;
+            record = { ...record, provider: "refused" };
+            finish("503", payload.length, `ClaudeRipple: ${reason}`, true, { ...(!searchAttempted ? { upstreamCalled: false as const } : {}), refusal: "unroutable" });
+            return;
+          }
           // Translators scope reasoning themselves. A native/compatible fallback cannot validate
           // the original provider's opaque signatures, whether selected by a ladder or a route.
           if (provider.type === "anthropic-compatible" || provider.type === "anthropic") {
@@ -1157,7 +1196,8 @@ export class Proxy {
             try {
               // The adapter reports each account's outcome to the shared pool itself, so a slot pointing
               // here fails over once every account is out (chooseTarget asks the adapter).
-              const o = await this.chatgpt(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, effortOf(json), { subagent, imageHint: imageLine(adminPort(cfg)) });
+              // The image hint is how a Claude Code session makes an image; the extension has no such tool.
+              const o = await this.chatgpt(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, effortOf(json), { subagent, ...(fromChrome ? { surface: "claude-in-chrome" as const } : { imageHint: imageLine(adminPort(cfg)) }) });
               if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
@@ -1202,7 +1242,7 @@ export class Proxy {
               return using.headers;
             } : undefined;
             try {
-              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { headers: using.headers, ...(next ? { next } : {}) });
+              const o = await this.openai(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { headers: using.headers, ...(next ? { next } : {}) }, surface);
               if (o.status >= 400) this.pool.penalise(poolName, using.id, o.upstreamStatus ?? o.status, o.retryAfterMs, o.errorBody);
               else if (o.status > 0) this.pool.succeed(poolName, using.id);
               if (!path.startsWith("/v1/messages/count_tokens")) {
@@ -1267,7 +1307,7 @@ export class Proxy {
               return candidate.headers;
             } : undefined;
             try {
-              const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, using ? { headers: provider.credentials?.length ? using.headers : {}, ...(next ? { next } : {}) } : undefined);
+              const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, using ? { headers: provider.credentials?.length ? using.headers : {}, ...(next ? { next } : {}) } : undefined, surface);
               if (o.kind === "prompt-incompatible" || o.kind === "model-capacity") {
                 const why = o.kind === "prompt-incompatible" ? "prompt" : "capacity";
                 const alreadyRetried = unwrittenSeen;
@@ -1327,7 +1367,7 @@ export class Proxy {
             if (routeEffort) record.effort = routeEffort;
             tag = `GROK ${route.tag} effort=${routeEffort ?? "-"}`;
             try {
-              const o = await this.grok(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort);
+              const o = await this.grok(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, surface);
               this.recordOutcome(route.provider, o.status);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...(o.usage ? { usage: o.usage } : {}), ...(o.stopReason ? { stopReason: o.stopReason } : {}) });
             } catch (e) {
@@ -1416,6 +1456,7 @@ export class Proxy {
             effort: effortOf(json),
             identity: provider.identity,
             instructionsAppend: provider.instructionsAppend,
+            surface,
           });
           body = Buffer.from(JSON.stringify(json));
           const u = new URL(provider.url);
@@ -1452,6 +1493,9 @@ export class Proxy {
               ? { [provider.sessionHeader]: conversationKey(json as AnthropicRequest), ...using.headers }
               : using.headers,
             dropClientAuth: true,
+            // A browser attaches its origin, fetch metadata, client hints and the extension's identity;
+            // none of it is the provider's business.
+            ...(fromChrome ? { dropHeaders: new Set(["origin", "referer", "cookie", "anthropic-dangerous-direct-browser-access"]), dropHeaderPrefixes: ["sec-fetch-", "sec-ch-", "anthropic-client-"] } : {}),
             // Providers mount their Anthropic-compatible API under a path (DeepSeek /anthropic, OpenRouter /api,
             // Qwen /apps/anthropic): the CLI's /v1/messages is appended to it. Dropping it sent requests to the
             // vendor's website, which answered 200 with HTML (measured 2026-09-13 with OpenRouter).
@@ -1478,10 +1522,14 @@ export class Proxy {
 
       if (json && typeof json.service_tier === "string") record.requestedTier = json.service_tier;
 
-      // Two kinds of response editing: the CLI bootstrap (api host) and the claude.ai bootstrap (picker mode).
+      // Three kinds of response editing: the CLI bootstrap (api host), the claude.ai bootstrap (picker
+      // mode) and Claude in Chrome's two model lists (api host, chrome-extension.ts).
       const isCliBootstrap = isApiHost && !route && path.startsWith(BOOTSTRAP_PATH);
       const isPickerBootstrap = !isApiHost && !!cfg.picker?.enabled && method === "GET" && isBootstrapPath(path);
-      const isBootstrap = isCliBootstrap || isPickerBootstrap;
+      const chromeEdit = isApiHost && !route && chromeExtensionEnabled(cfg) && isChromeListRequest(req.headers) ? chromeEditFor(method, pathname) : null;
+      const isBootstrap = isCliBootstrap || isPickerBootstrap || chromeEdit !== null;
+      // An edited list must not be revalidated against a copy the client cached before the edit.
+      const isFreshEdit = isPickerBootstrap || chromeEdit !== null;
       const headers: string[] = [];
       const raw = req.rawHeaders;
       for (let i = 0; i < raw.length; i += 2) {
@@ -1497,8 +1545,8 @@ export class Proxy {
           compatChanges.push("anthropic-beta");
           continue;
         }
-        // Picker bootstrap: never let the renderer revalidate against a cached (unedited) copy.
-        if (isPickerBootstrap && (lk === "if-none-match" || lk === "if-modified-since")) continue;
+        // Picker bootstrap and the extension lists: never revalidate against a cached (unedited) copy.
+        if (isFreshEdit && (lk === "if-none-match" || lk === "if-modified-since")) continue;
         headers.push(k, raw[i + 1]!);
       }
       for (const [k, v] of Object.entries(target.extraHeaders)) headers.push(k, v);
@@ -1733,7 +1781,7 @@ export class Proxy {
           const lk = r[i]!.toLowerCase();
           if (lk === "connection" || lk === "keep-alive" || lk === "transfer-encoding") continue;
           if (isBootstrap && (lk === "content-length" || lk === "content-encoding")) continue;
-          if (isPickerBootstrap && (lk === "etag" || lk === "last-modified")) continue;
+          if (isFreshEdit && (lk === "etag" || lk === "last-modified")) continue;
           // A truncated 403 is forwarded decoded (its bytes are no longer a whole compressed
           // stream), so neither the upstream's encoding nor its length describes what is sent.
           if (errTruncated && (lk === "content-length" || lk === "content-encoding")) continue;
@@ -1776,6 +1824,17 @@ export class Proxy {
                 }
               } catch (e) {
                 log.warn(`picker inject failed: ${(e as Error).message}`);
+              }
+            } else if (status === 200 && chromeEdit) {
+              try {
+                const j = JSON.parse(out.toString("utf8")) as Record<string, unknown>;
+                const models = chromeExtensionModels(cfg);
+                const effortFor = (model: string): string[] | undefined => effortLevelsForModel(cfg, model);
+                const n = chromeEdit === "features" ? injectChromeFeatures(j, models, effortFor) : injectChromeSelector(j, models, effortFor);
+                if (n > 0) out = Buffer.from(JSON.stringify(j));
+                log.info(`CHROME ${chromeEdit} injected ${n} of ${models.length} model(s)`);
+              } catch (e) {
+                log.warn(`chrome ${chromeEdit} inject failed: ${(e as Error).message}`);
               }
             }
             outHeaders.push("content-length", String(out.length));
