@@ -64,7 +64,9 @@ export type ImageRequest = {
 
 export type ImageResult = { data: Buffer; format: string; account?: string; borrowedLabel?: string; size?: string; quality?: string; revisedPrompt?: string; usage?: RequestUsage };
 
-export type ChatGptOutcome ={ status: number; bytes: number; account?: string; borrowedLabel?: string; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; requestedTier?: string; servedTier?: string; upstreamCalled?: false; refusal?: "no-account"; exhaustion?: ProviderExhaustion | undefined };
+export type ChatGptOutcome ={ status: number; bytes: number; account?: string; borrowedLabel?: string; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; requestedTier?: string; servedTier?: string; upstreamCalled?: false; refusal?: "no-account"; exhaustion?: ProviderExhaustion | undefined;
+  /** The backend refused the request with its HTTP status, before any of an answer (`OpenAiOutcome`). */
+  refusedBeforeAnswer?: true };
 
 /**
  * The name a row keeps for the borrowed Codex login when it is the account that answered. Its owner id is
@@ -1185,7 +1187,7 @@ export class ChatGptAdapter {
       res.writeHead(err.status, { "content-type": "application/json", ...(retryAfterSeconds ? { "retry-after": String(retryAfterSeconds) } : {}), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(err.body);
       return { status: err.status, bytes: err.body.length, note,
         ...(sent.kind === "no-account" ? { upstreamCalled: false as const, refusal: "no-account" as const } : {}),
-        ...(sent.kind === "refused" ? { account: sent.account } : {}),
+        ...(sent.kind === "refused" ? { account: sent.account, refusedBeforeAnswer: true as const } : {}),
         ...(sent.kind === "refused" && sent.borrowedLabel ? { borrowedLabel: sent.borrowedLabel } : {}),
         ...(sent.kind === "refused" && upstreamReq.service_tier !== undefined ? { requestedTier: upstreamReq.service_tier } : {}),
         ...(exhaustion ? { exhaustion } : {}),

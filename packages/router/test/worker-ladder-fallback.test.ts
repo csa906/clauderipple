@@ -80,7 +80,9 @@ for (const type of ['anthropic-compatible', 'openai-compatible', 'google'] as co
       };
       const line = workerLadderLine({ pick: 'pick-a', model: 'p:retired@high', fallbacks: ['next@low'] });
       try {
-        assert.equal(await send(`${line}\nTask`), failure === 'deprecated' ? (type === 'anthropic-compatible' ? 410 : 400) : 429);
+        // A definite exhaustion (the spending cap) that reached nobody fails over in that same turn
+        // (2026-11-20); a retirement or a plain rate limit is still discovered by the turn it answers.
+        assert.equal(await send(`${line}\nTask`), failure === 'billing' ? 200 : failure === 'deprecated' ? (type === 'anthropic-compatible' ? 410 : 400) : 429);
         assert.equal(seen.filter(m => m === 'retired').length, 1);
         // A 429 cools the key, so the pool itself knows the primary is unusable (#164): a ladder worker
         // no longer waits on it, the same as for a declared exhaustion.

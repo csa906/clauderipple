@@ -222,7 +222,9 @@ test('adding a key preserves the unchanged spent key cooldown', async () => {
     const p = cfg.providers.p;
     if (p?.type !== 'anthropic-compatible') throw new Error('fixture type');
     p.credentials = [{ id: 'old', headers: { 'x-api-key': 'old-test-key' } }];
-    assert.equal(await send(task(snapshot())), 429);
+    // Discovered by a request with no ladder, which has nowhere else to go: a worker with a fallback
+    // would be answered there in that same turn (2026-11-20).
+    assert.equal(await send(task('Task'), 'probe'), 429);
     p.credentials.push({ id: 'fresh', headers: { 'x-api-key': 'fresh-test-key' } });
     proxy.reconcileConfig(cfg);
     assert.equal(proxy.credentialHealth().p?.find(c => c.id === 'old')?.state, 'cooling');
@@ -235,11 +237,13 @@ test('a fresh credential added after exhaustion is tried before changing models'
   await fixture(async ({ send, seen, behavior, cfg }) => {
     behavior.retired = false;
     behavior.exhausted = true;
-    assert.equal(await send(task(snapshot())), 429);
+    // Discovered by a request with no ladder, which has nowhere else to go: a worker with a fallback
+    // would be answered there in that same turn (2026-11-20), and then stay on it (#164).
+    assert.equal(await send(task('Task'), 'probe'), 429);
     const p = cfg.providers.p;
     if (p?.type !== 'anthropic-compatible') throw new Error('fixture type');
     p.credentials = [{ id: 'fresh', headers: { 'x-api-key': 'fresh-test-key' } }];
-    assert.equal(await send(task('Continue')), 200);
+    assert.equal(await send(task(snapshot())), 200);
     assert.equal(seen.at(-1)?.model, 'primary');
   });
 });

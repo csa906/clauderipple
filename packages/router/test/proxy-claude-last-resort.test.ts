@@ -235,9 +235,12 @@ test("a smallFast title request goes to Claude when its provider is unusable, a 
 test("a smallFast request stays on its provider while that provider is usable", async () => {
   const r = await rig({ chatgptSignedIn: true, claude: true, smallFast: true });
   try {
-    await r.send(TITLE_BODY, { "x-claude-code-request-class": "auxiliary" });
-    assert.equal(r.claudeSeen.length, 0, "the primary was usable, so Claude was not used");
-    assert.equal(r.chatgptCalls.length >= 1, true);
+    const title = await r.send(TITLE_BODY, { "x-claude-code-request-class": "auxiliary" });
+    assert.equal(r.chatgptCalls.length >= 1, true, "the primary was usable, so it was asked first");
+    // Its answer is this rig's spent weekly quota: only that refusal, which reached nobody, hands the
+    // same turn to Claude (2026-11-20). Nothing chose Claude before the primary had answered.
+    assert.equal(r.claudeSeen.length, 1);
+    assert.match(title.record?.note ?? "", /in-turn failover from chatgpt\/gpt-6-luna \(429 quota_exhausted\)/);
   } finally { await r.stop(); }
 });
 

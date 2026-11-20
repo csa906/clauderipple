@@ -218,13 +218,15 @@ test("a ladder failover to a pinned Claude worker runs on that account", async (
   const rig = await fixture();
   try {
     const line = workerLadderLine({ pick: "pick-a", model: "primary@high", fallbacks: [`anthropic#${rig.pin}:claude-opus-5@high`] });
-    assert.equal(await rig.send(`${line}\nTask`), 429, "the primary's spending-cap 429 reaches the client first");
+    // The primary's spending-cap 429 reached nobody, so that same turn runs the ladder's fallback (2026-11-20).
+    assert.equal(await rig.send(`${line}\nTask`), 200, "the turn that discovers the spending cap is answered by the fallback");
     assert.equal(rig.primarySeen.length, 1);
-
-    assert.equal(await rig.send(`${line}\nTask`), 200, "the next turn runs the ladder's fallback");
     assert.deepEqual(rig.nativeSeen.map((row) => row.authorization), ["Bearer stored-token"], "the fallback used the pinned account, not the pool order");
     assert.equal(rig.nativeSeen[0]?.body.model, "claude-opus-5", "the pin never reaches the upstream");
     assert.doesNotMatch(JSON.stringify(rig.nativeSeen[0]?.body), /#/);
+
+    assert.equal(await rig.send(`${line}\nTask`), 200, "the next turn runs the ladder's fallback");
+    assert.deepEqual(rig.nativeSeen.map((row) => row.authorization), ["Bearer stored-token", "Bearer stored-token"], "and stays on the pinned account");
     assert.equal(rig.primarySeen.length, 1, "the exhausted primary is not asked a second time");
 
     const record = rig.requests.list(10).find((row) => row.provider === "anthropic");

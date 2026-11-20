@@ -44,7 +44,11 @@ const PING_MS = 15_000;
 /** How long the CCA model list is reused before asking again. */
 const MODELS_CACHE_MS = 60 * 60 * 1000;
 
-export type GoogleOutcome = { account?: string; upstreamStatus?: number; retryAfterMs?: number | undefined; errorBody?: string; status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; upstreamCalled?: false; refusal?: "no-account" | "prompt-incompatible"; exhaustion?: ProviderExhaustion | undefined; modelUnavailable?: ModelUnavailable | undefined } & (
+export type GoogleOutcome = { account?: string; upstreamStatus?: number; retryAfterMs?: number | undefined; errorBody?: string; status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; upstreamCalled?: false; refusal?: "no-account" | "prompt-incompatible"; exhaustion?: ProviderExhaustion | undefined; modelUnavailable?: ModelUnavailable | undefined;
+  /** Google refused the request with its HTTP status, before any of an answer (`OpenAiOutcome`). */
+  refusedBeforeAnswer?: true;
+  /** That refusal proved this model's quota group spent (`isGroupQuotaExhausted`), not the provider. */
+  spentGroup?: string } & (
   | { kind?: "response" }
   // No status or bytes have reached the client; the proxy may try one route fallback.
   | { kind: "prompt-incompatible"; status: 400; bytes: 0; errorBody: string }
@@ -868,7 +872,7 @@ export class GoogleAdapter {
       const exhaustion = providerExhaustion(upstream.status, text, retryAfterMs(Object.fromEntries(upstream.headers)) ?? googleRetryDelayMs(text));
       res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}) }).end(out.body);
       return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)) ?? googleRetryDelayMs(text), errorBody: text,
-        status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion, modelUnavailable: modelDeprecation(upstream.status, text) };
+        status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion, modelUnavailable: modelDeprecation(upstream.status, text), refusedBeforeAnswer: true };
     }
 
     return this.streamBack(res, upstream, transport, json, model, wantStream, key, startInput, controller, onClose, this.thoughtSignatures, redact);
@@ -963,7 +967,7 @@ export class GoogleAdapter {
       return { status: err.status, bytes: Buffer.byteLength(err.body), note,
         ...(sent.kind === "no-account" ? { upstreamCalled: false as const, refusal: "no-account" as const } : {}),
         ...(exhaustion ? { exhaustion } : {}),
-        ...(sent.kind === "refused" ? { account: sent.account, modelUnavailable: modelDeprecation(sent.status, sent.text) } : {}),
+        ...(sent.kind === "refused" ? { account: sent.account, modelUnavailable: modelDeprecation(sent.status, sent.text), refusedBeforeAnswer: true as const, ...(sent.group ? { spentGroup: sent.group } : {}) } : {}),
       };
     }
 

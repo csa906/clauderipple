@@ -895,7 +895,8 @@ export class Proxy {
     }
     // The agent files' derived aliases join the config's own, so a marker naming a worker resolves
     // the same way here as it does everywhere else. Explicit aliases win; the scan is mtime-cached.
-    const cfg = withAgentAliases(this.deps.config(), this.deps.agentDir ?? defaultAgentDir(), log);
+    const configured = this.deps.config();
+    const cfg = withAgentAliases(configured, this.deps.agentDir ?? defaultAgentDir(), log);
     this.reconcileConfig(cfg);
     const t0 = Date.now();
     const method = req.method ?? "?";
@@ -945,6 +946,12 @@ export class Proxy {
     // one route fallback per request.
     let unwrittenFallbackNote: string | undefined;
     let unwrittenSeen = false;
+    // Set once a definite exhaustion that reached nobody handed this request to another target
+    // (`holdQuotaRefusal`): one such failover per request, and none after the Google one above.
+    let failedOver = false;
+    let failoverNote: string | undefined;
+    /** The caller's Claude login is read once per request: a re-run must not put back an older one. */
+    let authObserved = false;
     // `failed` counts requests that did not get a proper response (vanished, upstream error,
     // provider error). A note alone is not a failure: adapters attach usage notes on success.
     const finish = (status: string, bytes: number, note?: string, failed: boolean = note !== undefined, extra?: { usage?: RequestUsage; stopReason?: string; resent?: boolean; account?: string; borrowedLabel?: string; messageId?: string; requestedTier?: string; servedTier?: string; upstreamCalled?: false | undefined; refusal?: RequestRecord["refusal"] }): void => {
@@ -958,7 +965,7 @@ export class Proxy {
         failed = true;
         note = "client closed";
       }
-      if (unwrittenFallbackNote) note = [unwrittenFallbackNote, note].filter(Boolean).join("; ");
+      if (failoverNote || unwrittenFallbackNote) note = [failoverNote, unwrittenFallbackNote, note].filter(Boolean).join("; ");
       this.stats.inFlight--;
       if (isMessages) {
         this.stats.messagesInFlight--;
@@ -989,7 +996,7 @@ export class Proxy {
         if (extra?.messageId !== undefined) completed.messageId = extra.messageId;
         if (extra?.requestedTier !== undefined) completed.requestedTier = extra.requestedTier;
         if (extra?.servedTier !== undefined) completed.servedTier = extra.servedTier;
-        if (extra?.upstreamCalled === false && !unwrittenSeen) completed.upstreamCalled = false;
+        if (extra?.upstreamCalled === false && !unwrittenSeen && !failedOver) completed.upstreamCalled = false;
         if (extra?.refusal !== undefined) completed.refusal = extra.refusal;
         const provider = cfg.providers[completed.provider];
         if (completed.ok && completed.kind === "messages" && completed.messageId && provider && provider.type !== "anthropic") {
@@ -1211,9 +1218,72 @@ export class Proxy {
     const run = async (override: Override | null): Promise<void> => {
       const fetchTarget = override?.route ?? null;
       let attemptDone = false;
-      const res = override ? deferErrorResponse(response, () => attemptDone) : response;
+      // What this attempt started from, for the in-turn failover below to start again from.
+      const startBody = body;
+      const startRecord = { ...record };
+      const startTag = tag;
+      const startNote = unwrittenFallbackNote;
+      /** Set while this attempt's quota refusal can still hand the turn to another target. */
+      let refusalHold: HeldRefusal | undefined;
+      /**
+       * This attempt's target answered with a definite exhaustion before answering anything else. Per
+       * attempt: an override's refusal, or an earlier dispatch's, is no evidence about this one.
+       */
+      let refusedSpent: { provider: string; model: string; status: number; reason: string } | undefined;
+      const noteRefusedSpent = (target: Pick<Resolved, "provider" | "model">, status: number, reason: string | undefined): void => {
+        if (reason) refusedSpent = { provider: target.provider, model: target.model, status, reason };
+      };
+      let failover: { placed: Resolved; ladderKey: string | undefined; attempted: () => Resolved | null } | undefined;
+      let res = override ? deferErrorResponse(response, () => attemptDone) : response;
       const finish: typeof complete = (status, bytes, note, failed, extra) => {
         if (attemptDone) return;
+        if (refusalHold && failover) {
+          // The target refused with a definite exhaustion (a spent quota, billing, a Claude window)
+          // before it answered anything, and none of it has reached the client. The router used to
+          // learn the exhaustion from this answer and hand the answer itself to the client, which
+          // `x-should-retry: false` then ended the turn on; only the next request failed over. After
+          // every restart that was the first request to a spent provider (2026-11-20). Now this same
+          // turn goes where the next request would (`planTarget`: the allowed fallbacks, in order),
+          // once, starting from what this attempt started from. Without such a target, or once the
+          // client has gone, the refusal is sent exactly as it was written.
+          const attempted = failover.attempted();
+          const spent = refusedSpent;
+          // The socket says first that the client left: the response and request only learn of it on a
+          // later event (measured, Node 24.16). A config saved meanwhile may have removed or replaced the
+          // fallback this request read at its start; the refusal then goes out, and the next request
+          // decides with the new config.
+          if (refusalHold.holding() && attempted && spent && spent.provider === attempted.provider && spent.model === attempted.model &&
+              !failedOver && !unwrittenSeen && !clientClosed && !response.destroyed && !response.socket?.destroyed && !req.aborted &&
+              this.deps.config() === configured) {
+            const next = this.planTarget(failover.placed, cfg, failover.ladderKey).route;
+            if (next.provider !== attempted.provider || next.model !== attempted.model) {
+              attemptDone = true;
+              refusalHold.discard();
+              failedOver = true;
+              // An upstream was called: no local refusal later on this request may say otherwise.
+              searchAttempted = true;
+              failoverNote = `in-turn failover from ${attempted.provider}/${attempted.model} (${spent.status} ${spent.reason})`;
+              log.warn(`${tag} -> ${spent.status} ${spent.reason} before anything reached the client; failing over in turn`);
+              body = startBody;
+              json = JSON.parse(startBody.toString("utf8")) as Record<string, unknown>;
+              record = { ...startRecord };
+              tag = startTag;
+              unwrittenFallbackNote = startNote;
+              observedUsage = undefined;
+              observedStopReason = undefined;
+              poolScope = undefined;
+              loginWatch = undefined;
+              loginWatchFor = undefined;
+              void run(null).catch((error: Error) => {
+                complete("502", 0, `in-turn failover error: ${error.message}`);
+                if (!response.headersSent) response.writeHead(502).end();
+                else response.destroy();
+              });
+              return;
+            }
+          }
+          refusalHold.commit();
+        }
         if (override && !response.headersSent && !response.destroyed && !req.aborted && (Number(status) < 200 || Number(status) >= 300 || !Number.isFinite(Number(status)))) {
           attemptDone = true;
           // A later local refusal must not claim that no upstream was called on this request.
@@ -1332,6 +1402,8 @@ export class Proxy {
         unwrittenFallbackNote = `fallback to Claude (${resolved.provider} unusable)`;
         log.warn(`${kind}: ${resolved.provider}/${resolved.model} unusable; falling back to Claude (${route.provider}/${route.model})`);
       }
+      /** The target the fallback rules chose, before a web search guard below may send the turn elsewhere. */
+      const selected = route;
       /** The request before any target rewrote it, kept only when a Google target may hand the turn back. */
       let pristine: typeof json | undefined;
       const source = typeof model === "string" ? model : "-";
@@ -1351,7 +1423,10 @@ export class Proxy {
       // but routed traffic while it was being used through the pool (issue #123, 2026-11-05). The
       // observation also follows a token refresh or an account switch on the app's next request.
       // Do not inspect it elsewhere: it must never enter logs, RequestLog, picker diagnostics, or admin data.
-      if (isApiHost && pathname === "/v1/messages") this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
+      if (isApiHost && pathname === "/v1/messages" && !authObserved) {
+        authObserved = true;
+        this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
+      }
 
       // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
       // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
@@ -1426,6 +1501,14 @@ export class Proxy {
       /** This attempt goes out on a native Claude account-pool credential, so its answer names a thread. */
       let poolAnswer = false;
       let target: { protocol: "http:" | "https:"; host: string; port: number; agent: http.Agent | https.Agent; extraHeaders: Record<string, string>; basePath?: string; dropClientAuth?: boolean; dropHeaders?: Set<string>; dropHeaderPrefixes?: string[] };
+      // A turn with somewhere else to go holds a quota refusal back (`finish` above decides). Only the
+      // target the fallback rules chose: a web search the guard above re-sent keeps its own ladder.
+      if (!override && !failedOver && route && selected && json && pathname === "/v1/messages" && placed?.fallbacks?.length &&
+          route.provider === selected.provider && route.model === selected.model) {
+        refusalHold = holdQuotaRefusal(response);
+        res = refusalHold.res;
+        failover = { placed, ladderKey, attempted: () => route };
+      }
       // Re-enter only for the one unwritten Google turn (prompt refusal or no model capacity). Each target sees the original
       // request, not the primary's rewritten effort, stripped thread, or translated body.
       for (;;) {
@@ -1481,6 +1564,7 @@ export class Proxy {
               // here fails over once every account is out (chooseTarget asks the adapter).
               const o = await this.chatgpt(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, effortOf(json), { subagent, imageHint: imageLine(adminPort(cfg)), kind: route.kind, ...(route.accountPin ? { accountPin: route.accountPin } : {}) });
               if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
+              if (o.refusedBeforeAnswer) noteRefusedSpent(route, o.status, o.exhaustion?.reason);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
               finish("-", 0, `chatgpt error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
@@ -1531,6 +1615,8 @@ export class Proxy {
                 this.providerHealth.observe(route.provider, o.status, o.exhaustion);
                 this.modelHealth.observe(route.provider, route.model, o.modelUnavailable);
               }
+              // The vendor's status, not the one sent on: a 402 reaches the client as a 400 (mapHttpError).
+              if (o.refusedBeforeAnswer) noteRefusedSpent(route, o.upstreamStatus ?? o.status, o.exhaustion?.reason);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
               if (!res.destroyed && !req.aborted) this.pool.penalise(poolName, using.id, 0);
@@ -1592,7 +1678,8 @@ export class Proxy {
               const o = await this.google(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, using ? { headers: provider.credentials?.length ? using.headers : {}, ...(next ? { next } : {}) } : undefined, { kind: route.kind, ...(route.accountPin ? { accountPin: route.accountPin } : {}) });
               if (o.kind === "prompt-incompatible" || o.kind === "model-capacity") {
                 const why = o.kind === "prompt-incompatible" ? "prompt" : "capacity";
-                const alreadyRetried = unwrittenSeen;
+                // One route fallback per request: a turn a quota refusal already handed over keeps it.
+                const alreadyRetried = unwrittenSeen || failedOver;
                 unwrittenSeen = true;
                 if (res.destroyed || res.writableEnded || res.headersSent) {
                   finish("0", 0, `client closed before ${why} fallback`, true);
@@ -1623,6 +1710,9 @@ export class Proxy {
                 this.providerHealth.observe(route.provider, o.status, o.exhaustion);
                 this.modelHealth.observe(route.provider, route.model, o.modelUnavailable);
               }
+              // A quota group the refusal proved spent is not the provider's exhaustion, but it is this
+              // model's: the account's other group still answers, this model cannot (`hasUsable`).
+              if (o.refusedBeforeAnswer) noteRefusedSpent(route, o.upstreamStatus ?? o.status, o.exhaustion?.reason ?? (o.spentGroup ? "quota_group_exhausted" : undefined));
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
               if (using) this.pool.penalise(poolName, using.id, 0);
@@ -1651,6 +1741,7 @@ export class Proxy {
             try {
               const o = await this.grok(route.provider, provider).handle(req, res, path, json as unknown as AnthropicRequest, route.model, routeEffort, { kind: route.kind });
               this.recordOutcome(route.provider, o.status);
+              if (o.refusedBeforeAnswer) noteRefusedSpent(route, o.status, o.exhaustion?.reason);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...(o.usage ? { usage: o.usage } : {}), ...(o.stopReason ? { stopReason: o.stopReason } : {}) });
             } catch (e) {
               this.recordOutcome(route.provider, 0);
@@ -2301,6 +2392,9 @@ export class Proxy {
           // The stream forward below cannot reach its own end handler when the body is already here.
           if (route && path.startsWith("/v1/messages") && !path.startsWith("/v1/messages/count_tokens")) {
             this.providerHealth.observe(route.provider, status, exhaustion);
+            // A Claude window the unified headers say is spent is as definite: told not to retry, the
+            // caller would end the turn on it. Its account was charged above, so the pool knows it.
+            if (status === 402 || status === 429) noteRefusedSpent(route, status, exhaustion?.reason ?? (limitMs !== undefined ? "window_spent" : undefined));
           }
         }
         res.writeHead(status, outHeaders);
@@ -2555,28 +2649,16 @@ export class Proxy {
    * rather than the router inventing a refusal, and the answer it gives is what updates the pool.
    */
   private chooseTarget(resolved: Resolved, cfg: Config, log: Logger, ladderKey?: string, why?: { reason?: string }): Resolved {
-    if (!resolved.fallbacks?.length) {
-      // The turn runs on the primary, so a remembered fallback is over: re-ticking it later must not
-      // pull this worker off a primary that is usable. Only the worker's own ladder turn says so: a
-      // side request on the same key (WebFetch's reader) carries no ladder and must not end it.
-      if (resolved.ladderPick && ladderKey) this.ladderSticky.delete(ladderKey);
-      return resolved;
+    const { route, reason } = this.planTarget(resolved, cfg, ladderKey);
+    if (route !== resolved) {
+      log.info(`${resolved.ladderPick ? `LADDER pick=${resolved.ladderPick}` : "FAILOVER"} ${resolved.provider}/${resolved.model} → ${route.provider}/${route.model} reason=${reason ?? "provider_unusable"}`);
+      if (why) why.reason = reason ?? "provider_unusable";
     }
-    // A ladder worker with a key keeps the fallback it already moved to (#164). The fallback must
-    // still be on the CURRENT ladder (`fallbacks` was filtered against it) and usable; otherwise the
-    // normal selection below runs again and its outcome replaces the remembered one.
-    const sticky = resolved.ladderPick && ladderKey ? this.ladderSticky.get(ladderKey) : undefined;
-    if (sticky) {
-      const f = resolved.fallbacks.find(x => x.provider === sticky.provider && x.model === sticky.model &&
-        (x.effort ?? resolved.effort) === sticky.effort && !(x.provider === resolved.provider && x.model === resolved.model));
-      if (f && this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) {
-        log.info(`LADDER pick=${resolved.ladderPick} ${resolved.provider}/${resolved.model} → ${f.provider}/${f.model} reason=sticky`);
-        if (why) why.reason = "sticky";
-        return this.fallbackRoute(resolved, f);
-      }
-    }
-    const route = this.selectTarget(resolved, cfg, log, why);
-    if (resolved.ladderPick && ladderKey) {
+    // A sticky fallback is the remembered choice itself. Any other outcome replaces it: the turn runs
+    // on the primary, so a remembered fallback is over (re-ticking it later must not pull this worker
+    // off a primary that is usable), or on the fallback just chosen. Only the worker's own ladder turn
+    // says so: a side request on the same key (WebFetch's reader) carries no ladder and must not end it.
+    if (resolved.ladderPick && ladderKey && reason !== "sticky") {
       this.ladderSticky.delete(ladderKey);
       if (route !== resolved) {
         this.ladderSticky.set(ladderKey, { provider: route.provider, model: route.model, effort: route.effort });
@@ -2586,20 +2668,33 @@ export class Proxy {
     return route;
   }
 
-  private selectTarget(resolved: Resolved, cfg: Config, log: Logger, why?: { reason?: string }): Resolved {
+  /**
+   * What `chooseTarget` picks, without its log line or any change to the sticky map: the in-turn
+   * failover after a definite exhaustion asks it whether the next request would go somewhere else.
+   * `reason` is set when the pick is not the primary.
+   */
+  private planTarget(resolved: Resolved, cfg: Config, ladderKey?: string): { route: Resolved; reason?: string } {
+    if (!resolved.fallbacks?.length) return { route: resolved };
+    // A ladder worker with a key keeps the fallback it already moved to (#164). The fallback must
+    // still be on the CURRENT ladder (`fallbacks` was filtered against it) and usable; otherwise the
+    // normal selection below runs again and its outcome replaces the remembered one.
+    const sticky = resolved.ladderPick && ladderKey ? this.ladderSticky.get(ladderKey) : undefined;
+    if (sticky) {
+      const f = resolved.fallbacks.find(x => x.provider === sticky.provider && x.model === sticky.model &&
+        (x.effort ?? resolved.effort) === sticky.effort && !(x.provider === resolved.provider && x.model === resolved.model));
+      if (f && this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) return { route: this.fallbackRoute(resolved, f), reason: "sticky" };
+    }
     const reason = this.unavailableReason(resolved);
     // A ladder worker is not held on a primary just because nothing has been declared exhausted: an
     // API key that every credential of is cooling after a 429 would stall it. `targetUsable` below
     // keeps a primary with any usable credential, and moves one with none to the first usable fallback.
-    if (this.targetUsable(resolved, cfg)) return resolved;
-    for (const f of resolved.fallbacks ?? []) {
+    if (this.targetUsable(resolved, cfg)) return { route: resolved };
+    for (const f of resolved.fallbacks) {
       if (f.provider === resolved.provider && f.model === resolved.model) continue;
       if (!this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) continue;
-      log.info(`${resolved.ladderPick ? `LADDER pick=${resolved.ladderPick}` : "FAILOVER"} ${resolved.provider}/${resolved.model} → ${f.provider}/${f.model} reason=${reason ?? "provider_unusable"}`);
-      if (why) why.reason = reason ?? "provider_unusable";
-      return this.fallbackRoute(resolved, f);
+      return { route: this.fallbackRoute(resolved, f), reason: reason ?? "provider_unusable" };
     }
-    return resolved;
+    return { route: resolved };
   }
 
   private fallbackRoute(resolved: Resolved, f: NonNullable<Resolved["fallbacks"]>[number]): Resolved {
@@ -2794,6 +2889,85 @@ function onlyReminders(text: string): boolean {
     at = end + "</system-reminder>".length;
     found = true;
   }
+}
+
+/** An attempt's response written through `holdQuotaRefusal`. */
+type HeldRefusal = {
+  /** What the attempt writes to. */
+  res: http.ServerResponse;
+  /** A 400/402/429 is held: nothing of this attempt has reached the client. */
+  holding(): boolean;
+  /** Send what was held, exactly as it was written, and let everything after it straight through. */
+  commit(): void;
+  /** Drop what was held and anything this attempt writes later: another attempt answers instead. */
+  discard(): void;
+};
+
+/**
+ * Hold back the statuses a definite exhaustion is answered with, 402 and 429, and 400, which is what
+ * the translators make of an upstream 402 (`mapHttpError`), until the proxy has decided whether
+ * another target can still take the turn (2026-11-20, §5). Every other status, and
+ * everything after a success header, goes straight through with real backpressure: a turn that
+ * streams is never held, and nothing is buffered but a small refusal. Read through the wrapper, a
+ * held response looks written (`headersSent`, `writableEnded`, `statusCode`), so the adapter's own
+ * control flow is the one it always had, and a commit replays its calls in the order it made them.
+ */
+function holdQuotaRefusal(response: http.ServerResponse): HeldRefusal {
+  type Call = "writeHead" | "write" | "end" | "flushHeaders" | "destroy";
+  let state: "open" | "holding" | "through" | "discarded" = "open";
+  let calls: { key: Call; args: unknown[] }[] = [];
+  let status = 0;
+  let ended = false;
+  const guarded: http.ServerResponse = new globalThis.Proxy(response, {
+    get(target, key) {
+      if (state === "holding" || state === "discarded") {
+        if (key === "headersSent") return true;
+        if (key === "writableEnded" || key === "finished") return ended;
+        if (key === "statusCode") return status;
+      }
+      if (key === "writeHead") return (...args: unknown[]) => {
+        if (state === "discarded") return guarded;
+        if (state === "holding") {
+          // What Node does with a second head, at the moment the attempt would have met it.
+          throw Object.assign(new Error("Cannot write headers after they are sent to the client"), { code: "ERR_HTTP_HEADERS_SENT" });
+        }
+        if (state === "open" && !target.headersSent && (args[0] === 400 || args[0] === 402 || args[0] === 429)) {
+          state = "holding";
+          status = args[0];
+          calls.push({ key, args });
+          return guarded;
+        }
+        state = "through";
+        return Reflect.apply(target.writeHead, target, args);
+      };
+      if (key === "write" || key === "end" || key === "flushHeaders" || key === "destroy") return (...args: unknown[]) => {
+        if (state === "holding" || state === "discarded") {
+          if (state === "holding") calls.push({ key, args });
+          if (key === "end") ended = true;
+          return key === "write" ? true : key === "flushHeaders" ? undefined : guarded;
+        }
+        state = "through";
+        return Reflect.apply(target[key], target, args);
+      };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    res: guarded,
+    holding: () => state === "holding",
+    commit: () => {
+      if (state === "through" || state === "discarded") return;
+      const held = calls;
+      calls = [];
+      state = "through";
+      for (const call of held) Reflect.apply(response[call.key], response, call.args);
+    },
+    discard: () => {
+      state = "discarded";
+      calls = [];
+    },
+  };
 }
 
 /**

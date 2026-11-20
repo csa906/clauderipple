@@ -945,11 +945,13 @@ async function frig(opts: {
   routes: () => Config["routes"];
   /** Overrides for the Google fake: default refuses any prompt carrying the SDK paragraph. */
   google?: (hit: Hit, n: number) => Reply;
+  /** Overrides for the Anthropic-shaped vendor `c`: default answers "compat answer". */
+  compat?: (hit: Hit, n: number) => Reply;
   quota?: Quota;
   accounts?: number;
 }): Promise<FRig> {
   const google = await recorder((hit, n) => opts.google ? opts.google(hit, n) : carriesSdk(hit) ? { status: 429, body: JSON.stringify(GENERIC_429) } : googleAnswer(hit));
-  const compat = await recorder((hit) => anthropicReply(hit, "compat answer"));
+  const compat = await recorder((hit, n) => opts.compat ? opts.compat(hit, n) : anthropicReply(hit, "compat answer"));
   const openai = await recorder((hit) => hit.body?.stream === true
     ? { status: 200, headers: { "content-type": "text/event-stream" }, body: `data: ${JSON.stringify({ choices: [{ delta: { content: "openai answer" }, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 6, completion_tokens: 2 } })}\n\ndata: [DONE]\n\n` }
     : { status: 200, body: JSON.stringify({ id: "c", choices: [{ message: { role: "assistant", content: "openai answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 6, completion_tokens: 2 } }) });
@@ -1610,4 +1612,46 @@ test("no capacity on the fallback too: one fallback only, then the clear 529", a
     assert.equal(r.compat.hits.length, 0, "the cap holds although another fallback was configured");
     assert.deepEqual(r.states(), ["ready"]);
   } finally { restore(); await r.stop(); }
+});
+
+// The in-turn quota failover (2026-11-20) and the capacity fallback share the one-route-fallback cap:
+// a turn a spent quota already handed over is not handed over again for Google's capacity.
+test("a turn a spent quota handed to Google keeps Google's capacity 529: no third target", async () => {
+  const restore = withShortCapacityWaits();
+  const spent = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "insufficient_quota: the monthly quota of this key is used up" } });
+  const r = await frig({
+    routes: () => ({ "claude-opus-4-8": { provider: "c", model: "fb-model", fallbacks: [{ provider: "g", model: "gemini-3.8-flash" }, { provider: "o", model: "oa-model" }] } as Config["routes"][string] }),
+    compat: () => ({ status: 429, body: spent }),
+    google: () => ({ status: 503, body: CAPACITY_503 }),
+  });
+  try {
+    const res = await r.post(turn({ system: "Ordinary system instructions.", stream: false }));
+    assert.equal(res.status, 529);
+    assert.equal(errorOf(res.text).type, "overloaded_error");
+    assert.ok(r.compat.hits.length >= 1, "the spent primary was asked");
+    assert.equal(r.google.hits.length, 3, "the quota failover went to Google");
+    assert.equal(r.openai.hits.length, 0, "the capacity refusal did not start a second fallback");
+    const [rec] = await r.records();
+    assert.equal(rec!.provider, "g");
+    assert.match(rec!.note ?? "", /in-turn failover from c\/fb-model \(429 quota_exhausted\)/);
+  } finally { restore(); await r.stop(); }
+});
+
+test("an Antigravity quota group spent for the turn's model hands the turn to the route fallback in that turn", async () => {
+  // The group's refusal is not the provider's exhaustion (the other group still answers), but this
+  // model cannot answer on any account until the group resets.
+  const groupSpent = JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Individual quota reached. Resets in 4h51m35s.",
+    details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "QUOTA_EXHAUSTED", domain: "cloudcode-pa.googleapis.com", metadata: { model: "gemini-3.8-flash" } }] } });
+  const r = await frig({ routes: () => route([{ provider: "o", model: "oa-model" }]), google: () => ({ status: 429, body: groupSpent }) });
+  try {
+    const res = await r.post(turn({ system: "Ordinary system instructions.", stream: false }));
+    assert.equal(res.status, 200);
+    assert.match(res.text, /openai answer/);
+    assert.doesNotMatch(res.text, /Individual quota reached|every signed-in account/);
+    assert.equal(r.google.hits.length, 1);
+    assert.equal(r.openai.hits.length, 1);
+    const [rec] = await r.records();
+    assert.equal(rec!.provider, "o");
+    assert.match(rec!.note ?? "", /in-turn failover from g\/gemini-3\.8-flash \(429 quota_group_exhausted\)/);
+  } finally { await r.stop(); }
 });

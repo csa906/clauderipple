@@ -28,7 +28,14 @@ export type OpenAiCredential = {
   next?: (status: number, retryAfterMs: number | undefined, body: string) => Record<string, string> | null;
 };
 
-export type OpenAiOutcome = { upstreamStatus?: number; retryAfterMs?: number | undefined; errorBody?: string; status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; servedTier?: string; exhaustion?: ProviderExhaustion | undefined; modelUnavailable?: ModelUnavailable | undefined };
+export type OpenAiOutcome = {
+  upstreamStatus?: number; retryAfterMs?: number | undefined; errorBody?: string; status: number; bytes: number; note?: string; usage?: RequestUsage; stopReason?: string; messageId?: string; servedTier?: string; exhaustion?: ProviderExhaustion | undefined; modelUnavailable?: ModelUnavailable | undefined;
+  /**
+   * The vendor refused the request with its HTTP status, before any of an answer: asking another
+   * target cannot bill the turn twice. A failure inside a started answer never carries it.
+   */
+  refusedBeforeAnswer?: true;
+};
 
 function anthropicError(status: number, type: string, message: string): { status: number; body: string } {
   return { status, body: JSON.stringify({ type: "error", error: { type, message } }) };
@@ -309,7 +316,7 @@ export class OpenAiCompatibleAdapter {
       const missingThinking = requiresThinkingReplay(upstream.status, text);
       if (missingThinking) this.log.warn(`${this.tag} ${this.name}: missing required thinking for ${model}; assistantTurns=${JSON.stringify(assistantTurnShapes(json))}`);
       res.writeHead(out.status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(out.body)), ...(exhaustion ? exhaustionHeaders(exhaustion) : {}), ...(missingThinking ? { "x-should-retry": "false" } : {}) }).end(out.body);
-      return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)), errorBody: safeText, status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion, modelUnavailable: modelDeprecation(upstream.status, text) };
+      return { upstreamStatus: upstream.status, retryAfterMs: retryAfterMs(Object.fromEntries(upstream.headers)), errorBody: safeText, status: out.status, bytes: Buffer.byteLength(out.body), note: `upstream ${upstream.status}`, exhaustion, modelUnavailable: modelDeprecation(upstream.status, text), refusedBeforeAnswer: true };
     }
 
     const wantStream = json.stream === true;
