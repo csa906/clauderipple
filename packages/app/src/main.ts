@@ -29,7 +29,7 @@ type Status = {
   /** Reported from 0.1.2 on; an older router leaves it out. */
   runtime?: { node: string; router: string | null; startedAt: string };
   /** Reported from 0.1.2 on: whether requests can actually go through, and what is in the way. */
-  readiness?: { ready: boolean; problems: ("settings" | "upstream" | "picker-ca" | "picker-proxy" | "config" | `provider:${string}`)[] };
+  readiness?: { ready: boolean; problems: ("settings" | "upstream" | "picker-ca" | "picker-proxy" | "picker-restart" | "config" | `provider:${string}`)[] };
   listen: { host: string; port: number };
   adminPort: number;
   stats: { started: number; completed: number; failed: number; inFlight: number };
@@ -123,6 +123,7 @@ const STRINGS = {
       : code === "upstream" ? "Anthropic is unreachable"
       : code === "picker-ca" ? "picker mode: certificate not trusted"
       : code === "picker-proxy" ? "picker mode: Claude Desktop proxy not set"
+      : code === "picker-restart" ? "picker mode: quit and reopen Claude Desktop"
       : code === "config" ? "the config file has errors"
       : code.startsWith("provider:") ? `provider ${code.slice(9)} unreachable`
       : code,
@@ -238,6 +239,7 @@ const STRINGS = {
       : code === "upstream" ? "Anthropic 연결 안 됨"
       : code === "picker-ca" ? "피커 모드: 인증서 신뢰 필요"
       : code === "picker-proxy" ? "피커 모드: Claude Desktop 프록시 설정 필요"
+      : code === "picker-restart" ? "피커 모드: Claude Desktop 재시작 필요"
       : code === "config" ? "설정 파일에 오류가 있음"
       : code.startsWith("provider:") ? `프로바이더 ${code.slice(9)} 연결 안 됨`
       : code,
@@ -353,6 +355,7 @@ const STRINGS = {
       : code === "upstream" ? "无法连接 Anthropic"
       : code === "picker-ca" ? "选择器模式：证书未被信任"
       : code === "picker-proxy" ? "选择器模式：未设置 Claude Desktop 代理"
+      : code === "picker-restart" ? "选择器模式：需要重启 Claude Desktop"
       : code === "config" ? "设置文件有错误"
       : code.startsWith("provider:") ? `无法连接供应商 ${code.slice(9)}`
       : code,
@@ -468,6 +471,7 @@ const STRINGS = {
       : code === "upstream" ? "Anthropicに接続できません"
       : code === "picker-ca" ? "ピッカーモード：証明書が信頼されていません"
       : code === "picker-proxy" ? "ピッカーモード：Claude Desktopのプロキシが未設定です"
+      : code === "picker-restart" ? "ピッカーモード：Claude Desktopの再起動が必要です"
       : code === "config" ? "設定ファイルにエラーがあります"
       : code.startsWith("provider:") ? `プロバイダー ${code.slice(9)} に接続できません`
       : code,
@@ -583,6 +587,7 @@ const STRINGS = {
       : code === "upstream" ? "No se puede acceder a Anthropic"
       : code === "picker-ca" ? "modo selector: el certificado no es de confianza"
       : code === "picker-proxy" ? "modo selector: proxy de Claude Desktop sin configurar"
+      : code === "picker-restart" ? "modo selector: reinicia Claude Desktop"
       : code === "config" ? "el archivo de ajustes tiene errores"
       : code.startsWith("provider:") ? `no se puede acceder al proveedor ${code.slice(9)}`
       : code,
@@ -698,6 +703,7 @@ const STRINGS = {
       : code === "upstream" ? "A Anthropic está inacessível"
       : code === "picker-ca" ? "modo seletor: certificado não confiável"
       : code === "picker-proxy" ? "modo seletor: proxy do Claude Desktop não configurado"
+      : code === "picker-restart" ? "modo seletor: reinicie o Claude Desktop"
       : code === "config" ? "o arquivo de configuração tem erros"
       : code.startsWith("provider:") ? `provedor ${code.slice(9)} inacessível`
       : code,

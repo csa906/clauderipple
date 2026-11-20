@@ -781,10 +781,33 @@ function readinessProblemText(code) {
   if (code === "settings") return t("health.diagnosticSettings");
   if (code === "upstream") return t("health.diagnosticUpstream");
   if (code === "picker-ca") return t("health.diagnosticPickerCa");
-  if (code === "picker-proxy") return t("health.diagnosticPickerProxy");
+  if (code === "picker-proxy") return t(pickerEntryForeign(status) ? "health.diagnosticPickerForeign" : pickerEntryUnreadable(status) ? "health.diagnosticPickerUnreadable" : "health.diagnosticPickerProxy");
+  if (code === "picker-restart") return t("health.diagnosticPickerRestart");
   if (code === "config") return t("health.diagnosticConfig");
   if (String(code).startsWith("provider:")) return t("health.diagnosticProvider", { name: String(code).slice(9) });
   return String(code);
+}
+/**
+ * Whether Claude Desktop applies what this installation leaves alone: another installation's entry,
+ * or a hybrid configuration, which it reads instead of any entry. Re-applying is refused there.
+ */
+function pickerEntryForeign(s) {
+  const holder = s && s.picker && s.picker.entry ? s.picker.entry.holder : null;
+  return holder === "installation" || holder === "hybrid";
+}
+/** Whether Claude Desktop's Config Library cannot be read: left as it is, and re-applying refuses too. */
+function pickerEntryUnreadable(s) {
+  return Boolean(s && s.picker && s.picker.entry && s.picker.entry.state === "unknown");
+}
+/**
+ * Whether the re-apply action would do anything: the router says the entry is one `picker reapply`
+ * fixes, and the certificate is trusted (over an untrusted one it refuses, since the app could not
+ * load claude.ai through the router; `picker on` is that fix).
+ */
+function pickerReapplyOffered(s) {
+  const entry = s && s.picker ? s.picker.entry : null;
+  const problems = (s && s.readiness && Array.isArray(s.readiness.problems)) ? s.readiness.problems : [];
+  return !(entry && entry.reapply === false) && !pickerEntryForeign(s) && !problems.includes("picker-ca");
 }
 /**
  * The problems the router reports, and the validation errors in its config: readiness once said
@@ -801,12 +824,19 @@ function renderDiagnostics() {
   const envProxy = (status.envProxy && Array.isArray(status.envProxy.set)) ? status.envProxy.set : [];
   wrap.hidden = problems.length === 0 && configErrors.length === 0 && envProxy.length === 0;
   if (wrap.hidden) { box.replaceChildren(); return; }
-  const rows = problems.map((code) => cell(readinessProblemText(code), badge("warn", String(code))));
+  // A missing Desktop entry is fixed by applying it again, not by a restart: the fix sits on its row,
+  // where re-applying would work.
+  const rows = problems.map((code) => code === "picker-proxy" && pickerReapplyOffered(status)
+    ? cell(readinessProblemText(code), [badge("warn", String(code)), pickerReapplyButton("picker-reapply:diagnostics")])
+    : cell(readinessProblemText(code), badge("warn", String(code))));
   for (const error of configErrors) rows.push(cell(t("health.diagnosticConfig"), badge("bad", "config"), [el("span", { class: "cell-sub mono", text: String(error) })]));
   // Not a fault: a proxy that is set but not needed changes nothing. Said anyway, because an
   // upstream call that needed one would otherwise fail with no hint why (G-D11).
   if (envProxy.length) rows.push(cell(t("health.diagnosticEnvProxy", { list: envProxy.join(", ") }), badge("warn", "env-proxy")));
+  // Rebuilt every five seconds: a keyboard user on the re-apply button keeps it.
+  const focused = focusedKey(box);
   box.replaceChildren(...rows);
+  refocusKey(box, focused);
 }
 /**
  * What a person can paste into a report without handing over a credential: versions, readiness,
@@ -1046,6 +1076,9 @@ const CONN_REASONS = [
   ["desktop-port-mismatch", "conn.why.oldSetting"],
   ["cli-foreign-proxy", "conn.why.cliOther"],
   ["desktop-foreign-proxy", "conn.why.desktopOther"],
+  ["desktop-entry-missing", "conn.why.desktopEntryMissing"],
+  ["desktop-entry-other", "conn.why.desktopEntryOther"],
+  ["desktop-entry-unreadable", "conn.why.desktopEntryUnreadable"],
 ];
 function connReason(doctor) {
   const problems = (doctor && doctor.problems) || [];
@@ -1076,6 +1109,14 @@ function connectionModel(s) {
     return { kind: "bad", title: t("conn.downTitle"), lead: t("conn.downLead"), reason, primary: repairFailed ? "direct-on" : "repair", secondary: repairFailed ? "repair" : "direct-on" };
   }
   if (!d && !(s && s.doctorFailed) && answering === null) return { kind: "checking", title: t("conn.checking"), lead: "", primary: null, secondary: null };
+  // Picker mode on and Desktop's entry gone reads as "mixed", but the way back is repair, which
+  // applies it again, not the direct switch (2026-11-19).
+  if (d && (d.problems || []).some((problem) => problem.code === "desktop-entry-missing")) return { kind: "warn", title: t("conn.warnTitle"), lead: t("conn.why.desktopEntryMissing"), primary: "repair", secondary: "direct-on" };
+  // Desktop applies something repair leaves alone, or its library cannot be read: neither repair nor
+  // the switch back (which, with no direct snapshot, changes nothing and reports success) helps, so
+  // there is no primary action. The re-apply action sits on the Clients page where it would work.
+  const leftAlone = d && (d.problems || []).find((problem) => problem.code === "desktop-entry-other" || problem.code === "desktop-entry-unreadable");
+  if (leftAlone) return { kind: "warn", title: t("conn.warnTitle"), lead: t(leftAlone.code === "desktop-entry-other" ? "conn.why.desktopEntryOther" : "conn.why.desktopEntryUnreadable"), primary: null, secondary: "direct-on" };
   if (d && d.mode === "mixed") return { kind: "warn", title: t("conn.mixedTitle"), lead: t("conn.mixedBody", { desktop: connRoute(d.desktop && d.desktop.proxy), cli: connRoute(d.cli && d.cli.proxy) }), primary: "direct-off", secondary: "direct-on" };
   const reason = d && connReason(d);
   if (reason) return { kind: "warn", title: t("conn.warnTitle"), lead: reason, primary: "repair", secondary: "direct-on" };
@@ -1488,13 +1529,26 @@ function renderClients() {
   // The switch rows are static markup, so a five-second refresh never takes keyboard focus off one;
   // only the rows after the switch are rebuilt.
   const pickerGroup = $("#client-picker-rows");
+  const pickerFocus = focusedKey(pickerGroup);
   while (pickerGroup.children.length > 1) pickerGroup.lastElementChild.remove();
   if (picker.enabled) {
     pickerGroup.append(
       el("div", { class: "cell-note", text: t("picker.models", { count: names.length, names: names.join(", ") || "—" }) }),
       el("div", { class: "cell-note", text: last && last.at ? t("picker.lastAt", { at: new Date(last.at).toLocaleString() }) : t("picker.never") }),
     );
+    // The switch here only turns picker mode off, which also removes the certificate. An entry that
+    // went missing while it stayed on gets its own action, and one the app has not picked up yet
+    // gets the restart it needs (2026-11-19).
+    const problems = (status.readiness && Array.isArray(status.readiness.problems)) ? status.readiness.problems : [];
+    if (problems.includes("picker-proxy") && pickerReapplyOffered(status)) {
+      pickerGroup.append(cell(t("picker.reapplyHelp"), pickerReapplyButton("picker-reapply:clients"), null, "picker-reapply-row"));
+    } else if (problems.includes("picker-proxy") && (pickerEntryForeign(status) || pickerEntryUnreadable(status))) {
+      pickerGroup.append(el("div", { class: "cell-note", text: readinessProblemText("picker-proxy") }));
+    } else if (problems.includes("picker-restart")) {
+      pickerGroup.append(el("div", { class: "cell-note", text: t("health.diagnosticPickerRestart") }));
+    }
   }
+  refocusKey(pickerGroup, pickerFocus);
   const pickerSwitch = $("#client-picker-toggle");
   pickerSwitch.checked = Boolean(picker.enabled);
   pickerSwitch.disabled = pickerBusy;
@@ -2111,6 +2165,47 @@ async function togglePicker(enabled, confirmed = false) {
     if (currentConfig) currentConfig.picker = { ...(currentConfig.picker || {}), enabled };
   } catch (error) {
     toast(t("common.actionFailed"), true, error.message);
+  } finally {
+    pickerBusy = false;
+    $("#client-picker-msg").textContent = "";
+    void refreshHealth();
+  }
+}
+/**
+ * The re-apply action, wherever the missing-entry problem is shown; busy while the CLI runs. `key`
+ * names it for focusedKey/refocusKey, since its row is rebuilt every five seconds.
+ */
+function pickerReapplyButton(key) {
+  return el("button", { class: "btn compact picker-reapply", type: "button", "data-key": key, text: t("picker.reapply"), disabled: pickerBusy ? "" : null, onclick: () => void reapplyPicker() });
+}
+/** The data-key of the control inside `root` that has keyboard focus, so a rebuild can give it back. */
+function focusedKey(root) {
+  const active = typeof document === "undefined" ? null : document.activeElement;
+  return active && root && root.contains(active) && active.dataset ? active.dataset.key || null : null;
+}
+function refocusKey(root, key) {
+  if (!key || !root) return;
+  const again = root.querySelector(`[data-key="${CSS.escape(key)}"]`);
+  if (again) again.focus();
+}
+/**
+ * `clauderipple picker reapply` through the router: only Claude Desktop's Config Library entry, so
+ * no trust dialog. The switch would have turned picker mode off, removing the certificate and asking
+ * a second time on Windows, without putting the entry back.
+ */
+async function reapplyPicker() {
+  if (pickerBusy) return;
+  pickerBusy = true;
+  for (const button of $all(".picker-reapply")) button.disabled = true;
+  $("#client-picker-msg").textContent = t("picker.working");
+  try {
+    await api("/api/picker/reapply", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    toast(t("picker.reapplyDone"));
+  } catch (error) {
+    // The CLI says why it refused (picker mode off, `direct on`, router down, another installation's entry).
+    const output = error.body && typeof error.body.output === "string" ? error.body.output : "";
+    const reason = (/^error: (.+)$/m.exec(output) || [])[1];
+    toast(t("common.actionFailed"), true, reason || error.message);
   } finally {
     pickerBusy = false;
     $("#client-picker-msg").textContent = "";

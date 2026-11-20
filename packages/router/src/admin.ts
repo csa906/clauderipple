@@ -66,7 +66,7 @@ import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
 import { fetchClaudeModels, newClaudeReleases, type ClaudeModel } from "./providers/anthropic-models.ts";
 import { codexEnabled, codexHome } from "../../cli/src/codex.ts";
 import { openBrowser } from "../../cli/src/browser.ts";
-import { caTrustedAsync, currentAppProxy } from "../../cli/src/picker.ts";
+import { appProxyState, caTrustedAsync, reapplyCanFix, type AppProxyState } from "../../cli/src/picker.ts";
 import { PickerTrust } from "./picker-trust.ts";
 import { certPaths } from "../../cli/src/certs.ts";
 import { desktopClaudeCodeDirs } from "../../cli/src/claude-auth.ts";
@@ -185,7 +185,8 @@ export type AdminDeps = {
   clearCredentialCooldown?: (provider: string, id: string) => void;
   claudeClearCooldown?: (id: string) => void;
   /** Optional: picker-mode state and the last bootstrap injection. */
-  picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
+  /** `seenAt`: when Claude Desktop's own claude.ai traffic last came through this process (ISO), or null. */
+  picker?: () => { enabled: boolean; hosts: string[]; last: unknown; seenAt?: string | null };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
   /** Test seam for Claude Code's keychain and credential-file readers. */
@@ -1162,12 +1163,23 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   if (configErrors.length) problems.push("config");
   if (env.HTTPS_PROXY !== wantProxy) problems.push("settings");
   if (deps.health() > 0) problems.push("upstream");
+  // What the app's Config Library holds, named for the GUI: whether `picker reapply` would fix it
+  // (it refuses another installation's entry, a hybrid configuration and direct mode).
+  let pickerEntry: { state: AppProxyState["state"]; holder: AppProxyState["holder"]; reapply: boolean } | null = null;
   if (picker.enabled) {
-    const trust = pickerTrust();
+    const directOn = fs.existsSync(path.join(homeDir(), "direct.json"));
+    const entry = appProxyState(wantProxy, homeDir());
+    pickerEntry = { state: entry.state, holder: entry.holder, reapply: reapplyCanFix(entry) && !directOn };
+    const trust = pickerTrust(entry, wantProxy, picker.seenAt ?? null, directOn);
     // null: the certificate has not been checked yet (the first check runs in the background); that
     // is not a problem to report.
     if (trust.caTrusted === false) problems.push("picker-ca");
-    if (!trust.appProxy) problems.push("picker-proxy");
+    // Two different fixes, so two codes: `picker-proxy` (stable for older readers) is an entry that
+    // is missing or not this router's, which only re-applying fixes; `picker-restart` is our entry,
+    // written while this router runs, that the app has not used yet. A restart alone cannot fix the
+    // first (2026-11-19: the advice said "restart Claude Desktop" over a deleted Config Library).
+    if (trust.appProxy === "missing") problems.push("picker-proxy");
+    else if (trust.appProxy === "restart") problems.push("picker-restart");
   }
   for (const [name, p] of Object.entries(providers)) if (p.reachable === false) problems.push(`provider:${name}`);
   return {
@@ -1211,7 +1223,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
     // Only present for providers that declare a pool; a provider with one credential has nothing
     // to report and would only add a row that never changes.
     credentials: deps.credentials?.() ?? {},
-    picker,
+    picker: pickerEntry ? { ...picker, entry: pickerEntry } : picker,
     statusMod: statusModEnabled(),
     pickerModels: chatPickerModels(cfg).map((m) => m.name || m.model),
     uiRevision: uiRevision(),
@@ -1224,14 +1236,25 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
  * proxy entry is two small file reads and stays on the request.
  */
 const caTrust = new PickerTrust({ check: () => caTrustedAsync(certPaths(homeDir()).caPem) });
-function pickerTrust(): { caTrusted: boolean | null; appProxy: boolean } {
-  let appProxy = false;
-  try {
-    appProxy = currentAppProxy().ours;
-  } catch {
-    // Unknown counts as not ready; the next poll tries again.
-  }
-  return { caTrusted: caTrust.get(), appProxy };
+function pickerTrust(entry: AppProxyState, wantProxy: string, seenAt: string | null, directOn: boolean): { caTrusted: boolean | null; appProxy: "ok" | "missing" | "restart" } {
+  return { caTrusted: caTrust.get(), appProxy: desktopEntryReadiness(entry, wantProxy, seenAt, Date.parse(STARTED_AT), directOn) };
+}
+
+/**
+ * Whether Claude Desktop's Config Library entry is in the way, from what is on disk and what this
+ * process saw. "missing": nothing that names this router is applied (gone, another app's or
+ * installation's choice, a hybrid pointer, an old port, unreadable), and only applying it again
+ * helps; while `direct on` holds the entry, that is by choice and not reported. "restart": our entry
+ * changed after this process started and no claude.ai traffic has come through since, so the app has
+ * not started with it. An entry older than this process says nothing either way (a router restart
+ * forgets what it saw), so it is "ok" rather than a guess.
+ */
+export function desktopEntryReadiness(entry: AppProxyState, wantProxy: string, seenAt: string | null, startedAtMs: number, directOn = fs.existsSync(path.join(homeDir(), "direct.json"))): "ok" | "missing" | "restart" {
+  const inEffect = entry.egressProxyUrl === wantProxy && (entry.state === "applied" || entry.state === "other");
+  if (!inEffect) return directOn ? "ok" : "missing";
+  if (entry.changedAt === null || entry.changedAt <= startedAtMs) return "ok";
+  const seen = seenAt === null ? NaN : Date.parse(seenAt);
+  return Number.isFinite(seen) && seen >= entry.changedAt ? "ok" : "restart";
 }
 
 /**
@@ -3275,6 +3298,15 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         }
         const r = await runCli(["picker", enabled ? "on" : "off"]);
         deps.log.info(`admin: picker ${enabled ? "on" : "off"} via GUI -> ${r.ok ? "ok" : "failed"}`);
+        sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
+        return;
+      }
+      if (pathname === "/api/picker/reapply" && method === "POST") {
+        // Only the Config Library step of `picker on` (`clauderipple picker reapply`): for an entry
+        // that went missing while picker mode stayed on. The switch would have run `picker off`,
+        // which also removes the CA and asks a second time on Windows.
+        const r = await (deps.runCli ?? runCli)(["picker", "reapply"]);
+        deps.log.info(`admin: picker reapply via GUI -> ${r.ok ? "ok" : "failed"}`);
         sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
         return;
       }

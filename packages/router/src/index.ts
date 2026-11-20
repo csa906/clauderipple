@@ -350,7 +350,7 @@ proxy
       credentials: () => proxy.credentialHealth(),
       clearCredentialCooldown: (provider, id) => proxy.clearCredentialCooldown(provider, id),
       claudeClearCooldown: (id) => proxy.claudeClearCooldown(id),
-      picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection }),
+      picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection, seenAt: proxy.lastPickerTrafficAt === null ? null : new Date(proxy.lastPickerTrafficAt).toISOString() }),
       observedClaudeCodeAuth,
       claudeUsage: () => proxy.claudeUsage.snapshot(),
       claudeModels: () => proxy.claudeModels.list(),

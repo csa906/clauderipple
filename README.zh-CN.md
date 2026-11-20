@@ -312,7 +312,7 @@ node packages/cli/src/index.ts install   # certs, settings.json env, supervisor 
 node packages/cli/src/index.ts ui        # open the local GUI in your browser
 ```
 
-`uninstall` 会撤销所有改动，并从备份恢复 `~/.claude/settings.json`。其他命令：`status`、`start`、`stop`、`restart`、`logs -f`、`login`、`logout`、`claude-login`、`claude-logout`、`picker on|off`、`agent-title on|off`、`mod on|off`、`codex on|off`、`update`、`image "<prompt>"`。
+`uninstall` 会撤销所有改动，并从备份恢复 `~/.claude/settings.json`。其他命令：`status`、`start`、`stop`、`restart`、`logs -f`、`login`、`logout`、`claude-login`、`claude-logout`、`picker on|off|reapply`、`agent-title on|off`、`mod on|off`、`codex on|off`、`update`、`image "<prompt>"`。
 </details>
 
 ## 客户端

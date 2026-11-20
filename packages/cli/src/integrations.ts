@@ -28,7 +28,7 @@ import { proxyUrlFor } from "./doctor.ts";
 import { readOwners } from "./owners.ts";
 import { sameHome } from "./ownership.ts";
 import type { DesktopServiceDeps } from "./desktop-service.ts";
-import { type CaRemoval, currentAppProxy, migrateLegacyAppProxy, removeAppProxy, untrustCa } from "./picker.ts";
+import { type CaRemoval, currentAppProxy, migrateLegacyAppProxy, ownsListedAppProxy, removeAppProxy, untrustCa } from "./picker.ts";
 import { setAgentTitleHook, setStatusMod, settingsPath } from "./settings.ts";
 import { runtime } from "./runtime.ts";
 
@@ -145,7 +145,23 @@ export function removeClientIntegrations(
       }
     }],
     ["the Claude Desktop proxy", () => {
-      const current = currentAppProxy();
+      let current: ReturnType<typeof currentAppProxy> | null = null;
+      let readError: unknown = null;
+      try {
+        current = currentAppProxy();
+      } catch (e) {
+        readError = e;
+      }
+      // This home's own entry that the app does not read (it applies another one, or ours lost its
+      // file) is still in Desktop's list, where it stays selectable and would point at a router
+      // that no longer runs: the record alone proves it is this home's to remove.
+      const appliedOurs = current?.ours === true && current.installationHome !== undefined && sameHome(current.installationHome, home);
+      if (!appliedOurs && ownsListedAppProxy(home)) {
+        if (removeAppProxy(undefined, home)) return "removed";
+        notes.push("could not remove this installation's Claude Desktop proxy");
+        return "failed";
+      }
+      if (!current) throw readError;
       if (!current.egressProxyUrl) return "absent";
       if (!current.ours) {
         notes.push("left the Claude Desktop proxy: it is not a ClaudeRipple entry");

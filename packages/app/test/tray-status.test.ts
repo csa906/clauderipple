@@ -142,7 +142,8 @@ test("every tray language names every failure", () => {
   }
 });
 
-for (const problem of ["picker-ca", "picker-proxy"]) {
+const PICKER_PROBLEM_LABEL: Record<string, string> = { "picker-ca": "인증서 신뢰 필요", "picker-proxy": "프록시 설정 필요", "picker-restart": "재시작 필요" };
+for (const problem of ["picker-ca", "picker-proxy", "picker-restart"]) {
   test(`readiness ${problem} failure changes the actual tray headline, icon and tooltip`, () => {
     const app = harness();
     const status = { ...good(), readiness: { ready: false, problems: [problem] } };
@@ -151,9 +152,16 @@ for (const problem of ["picker-ca", "picker-proxy"]) {
     assert.ok(shown.labels.includes("ClaudeRipple · 확인 필요"));
     assert.match(shown.image, /tray(?:Win)?Warn(?:Template)?\.png$/);
     assert.equal(shown.tooltip, "ClaudeRipple warn");
-    assert.ok(shown.labels.some(label => label.includes(problem === "picker-ca" ? "인증서 신뢰 필요" : "프록시 설정 필요")));
+    assert.ok(shown.labels.some(label => label.includes(PICKER_PROBLEM_LABEL[problem]!)), shown.labels.join(" | "));
   });
 }
+
+test("every tray language names picker-restart in its own words, not as the raw code", () => {
+  const source = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  const lines = source.split(/\r?\n/).filter((line) => line.includes('code === "picker-restart"'));
+  assert.equal(lines.length, 6, "one per tray language");
+  for (const line of lines) assert.match(line, /\? "[^"]*Claude Desktop[^"]*"/);
+});
 
 test("readiness is authoritative even if the old heuristic disagrees", () => {
   const app = harness();

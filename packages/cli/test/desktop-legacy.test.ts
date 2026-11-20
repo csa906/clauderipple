@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
-import { applyAppProxy, configLibraryDir, currentAppProxy, migrateLegacyAppProxy, removeAppProxy } from "../src/picker.ts";
+import { appliedIsMarked, applyAppProxy, configLibraryDir, currentAppProxy, migrateLegacyAppProxy, removeAppProxy } from "../src/picker.ts";
 import { setPickerEnabled } from "../src/integrations.ts";
 import { certPaths } from "../src/certs.ts";
 import { directOn } from "../src/direct.ts";
@@ -54,7 +54,7 @@ function pickerOffCommand(f: ReturnType<typeof fixture>) {
     configPath: () => path.join(f.home, "config.json"),
     ConfigStore: class { get() { return { listen: { port: 18791 } }; } },
     proxyUrlFor: (port: number) => `http://127.0.0.1:${port}`,
-    currentAppProxy, removeAppProxy,
+    appliedIsMarked, currentAppProxy, removeAppProxy,
     migrateLegacyAppProxy: (url: string, home: string) => migrateLegacyAppProxy(url, home, f.deps),
     setPickerEnabled: (enabled: boolean) => setPickerEnabled(enabled, path.join(f.home, "config.json")),
     certPaths, flag: () => false, isWindows: false, isLinux: false,

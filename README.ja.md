@@ -315,7 +315,7 @@ node packages/cli/src/index.ts install   # certs, settings.json env, supervisor 
 node packages/cli/src/index.ts ui        # open the local GUI in your browser
 ```
 
-`uninstall`はすべてを元に戻し、`~/.claude/settings.json`をバックアップから復元します。そのほかのコマンド：`status`、`start`、`stop`、`restart`、`logs -f`、`login`、`logout`、`claude-login`、`claude-logout`、`picker on|off`、`agent-title on|off`、`mod on|off`、`codex on|off`、`update`、`image "<prompt>"`。
+`uninstall`はすべてを元に戻し、`~/.claude/settings.json`をバックアップから復元します。そのほかのコマンド：`status`、`start`、`stop`、`restart`、`logs -f`、`login`、`logout`、`claude-login`、`claude-logout`、`picker on|off|reapply`、`agent-title on|off`、`mod on|off`、`codex on|off`、`update`、`image "<prompt>"`。
 </details>
 
 ## クライアント

@@ -434,7 +434,7 @@ node packages/cli/src/index.ts ui        # 브라우저에서 로컬 GUI 열기
 ```
 
 `uninstall`은 전부 되돌리고 `~/.claude/settings.json`을 백업에서 복원합니다. 그 밖의 명령: `status`, `start`, `stop`,
-`restart`, `logs -f`, `login`, `logout`, `claude-login`, `claude-logout`, `picker on|off`, `agent-title on|off`, `mod on|off`,
+`restart`, `logs -f`, `login`, `logout`, `claude-login`, `claude-logout`, `picker on|off|reapply`, `agent-title on|off`, `mod on|off`,
 `codex on|off`, `update`, `image "<프롬프트>"`.
 </details>
 

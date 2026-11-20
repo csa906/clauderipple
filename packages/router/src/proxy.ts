@@ -682,6 +682,12 @@ export class Proxy {
 
   /** Surfaces + model ids seen in the last injected bootstrap (admin GUI / debugging). */
   lastPickerInjection: { at: string; injected: number; surfaces: { id: string; models: string[]; entries: { id: string; name: string }[]; injected: string[] }[] } | null = null;
+  /**
+   * When a picker host (claude.ai) last reached this process (ms), in memory only. Only Claude
+   * Desktop's own traffic goes there through us, so readiness can tell an entry the app has not
+   * started with yet (`picker-restart`) from one it uses.
+   */
+  lastPickerTrafficAt: number | null = null;
 
   listen(): Promise<void> {
     const { host, port } = this.deps.config().listen;
@@ -766,7 +772,9 @@ export class Proxy {
       }
       sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (rest.length > 0) sock.unshift(rest);
-      if (terminateHosts(this.deps.config()).includes(host)) {
+      const cfg = this.deps.config();
+      if (terminateHosts(cfg).includes(host)) {
+        if (host !== cfg.upstream) this.lastPickerTrafficAt = Date.now();
         this.terminate(sock, host);
       } else {
         this.tunnel(sock, host, port);
@@ -1033,6 +1041,8 @@ export class Proxy {
     // anything else (claude.ai in picker mode) is passed through, with bootstrap injection.
     const reqHost = (req.headers.host ?? cfg.upstream).split(":")[0]!;
     const isApiHost = reqHost === cfg.upstream;
+    // A kept-alive socket sends no new CONNECT: every request counts as the app using us.
+    if (!isApiHost && cfg.picker?.enabled) this.lastPickerTrafficAt = Date.now();
     const ownKey = isApiHost && isMessages && callerOwnsKey(req.headers);
 
     // Route decision: only Messages requests carry a model.

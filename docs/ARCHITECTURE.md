@@ -340,6 +340,93 @@ chat is out of reach for every approach, ours included.
     the certificate is removed, so `picker off` prompts too.
   The app's own log line confirms the proxy took effect:
   `[egress-proxy] pinned to fixed proxy at 127.0.0.1:<port>; OS proxy settings ignored`.
+- **The Config Library as Desktop 6.6395 reads and edits it** (its `app.asar`,
+  `index.pre.js` and the main chunk, read 2026-11-20; behaviour of the bundle,
+  not of the UI):
+  - Root: `F6()` is a fixed `%LOCALAPPDATA%\Claude-3p` on win32, userData + `-3p`
+    elsewhere, and userData itself under the app's own `CLAUDE_USER_DATA_DIR`.
+  - `_meta.json` is `{ appliedId, entries: [{ id, name }] }`; Desktop's default
+    is `{ appliedId: "", entries: [] }` and its first entry is named "Default".
+    Only an `appliedId` matching `/^[a-f0-9-]{36}$/` is read. Its editor
+    (create, duplicate, rename, delete, apply) calls `entries.map` / `.some` /
+    `.push` on any meta it finds, even `{}`, so a meta without the array breaks
+    it. Ours is therefore listed there (`name: "ClaudeRipple"`) when its id is
+    one Desktop reads (an older version's other id never is). `picker off`
+    removes only that item and restores the previous `appliedId` while Desktop
+    can still read it (listed, or listed again as "Default" when only its file is
+    left). Never another listed entry, since the editor creates and duplicates
+    without applying (`uLi`/`dLi`), so one could be a copy of ours naming the
+    router being stopped, or a configuration the person never chose. With
+    nothing to restore, other entries still listed get what Desktop seeds for
+    itself, a new empty "Default" (`RU()`), applied: it holds no proxy, so the
+    app goes direct, and the app's flows that need an applied id still find
+    one. `appliedId: ""` is not enough there: the editor's `listConfigs` takes
+    it (its reply only needs a string, `VNt`), but the API-key sign-in refuses
+    it as an unknown config id (`JIi`). The remembered entry is never our own
+    one being deleted (a kept entry the person applied again, then reused).
+    With nothing listed, `_meta.json` itself goes: Desktop seeds "Default" for a
+    missing file, but keeps an empty one (`{entries: []}`, `appliedId: ""`) as
+    it is, and its flows that read `appliedId` then fail.
+  - The applied entry is the app's as well as ours: its API-key sign-in
+    (`signInWithAnthropicApiKey`) writes its provider keys into whatever entry
+    is applied, which it can do now that ours is listed. Only `egressProxyUrl`
+    is ours: apply keeps the other keys, and `off` leaves an entry that holds
+    any of them in place, listed, without the proxy, and applied when nothing
+    else is restored (the person's sign-in lives there). The record then
+    becomes a `keptId` pointer with no `ourId` (no ownership: nothing removes it
+    and it blocks no other installation), so the next apply on this home puts
+    the proxy back into that same entry instead of listing a second
+    "ClaudeRipple".
+    A PAC URL is the exception: Desktop's launch pin takes `egressProxyPacUrl`
+    over `egressProxyUrl` (`mme`/`Vwt`), so apply drops it from our entry.
+  - An applied entry of the app's whose file is gone reads as empty (`QIi`
+    returns `{}` on ENOENT): no proxy, the app goes direct, and apply replaces
+    it like any app choice. One a ClaudeRipple record names stays an error for
+    that record's installation.
+  - Listing ours makes it selectable in Desktop's editor, and the app can apply
+    another entry while ours stays listed (editor Apply, or Console sign-in
+    creating and applying "Claude API"). `picker off` and uninstall therefore
+    remove this installation's listed entry by its record even when it is not
+    applied, and so does an applied one whose file is gone; re-applying reuses
+    its id, so the list never holds two "ClaudeRipple" items. Another
+    installation's record whose entry is still listed or on disk is never taken
+    over: apply refuses it (that installation's `picker off` could not find its
+    entry again).
+  - A `hybridPointer.bootstrapUrl` in the meta replaces the applied entry
+    entirely (`Tpe()`): no entry, ours included, is in effect while it is set.
+    Desktop honours it only over https, on `api.anthropic.com`,
+    `api-staging.anthropic.com`, `api.claude.ai` or `config.claude.com`, with no
+    credentials in the URL (`n4`/`Zce`/`t4`); any other is ignored, and so is it
+    here. While one is in effect apply refuses (an entry written then would never
+    be read), and so does `picker on` before it asks the system to trust the CA;
+    doctor says to end it in Desktop or turn picker mode off, and we never
+    remove it. `direct off` still brings Claude Code back under one, and under
+    another installation's entry (one naming the same URL reads as `applied`,
+    since one router answers both), and says Desktop's side was left.
+  - A meta or entry that cannot be read is logged and treated as none: the app
+    goes direct.
+- **When the entry goes missing with picker mode on** (2026-11-19, a deleted
+  `Claude-3p`): `appProxyState` (picker.ts) names what the app will read
+  (`applied` / `missing` / `stale` / `other` / `unknown`). `repair` applies the
+  entry again by itself only while the app reads nothing of ours: `missing`
+  (nothing applied, or this installation's own applied file gone) or our entry
+  naming no proxy, which leaves the app direct just the same. It re-checks that
+  under the meta lock, and needs picker mode, the router answering and our CA
+  trusted (over an untrusted one every
+  claude.ai page fails, §5), and never while `direct on` holds the entry. An
+  entry another app, the person or another installation applied is reported
+  (`desktop-entry-other`, with advice per holder: `app` / `installation` /
+  `hybrid`) and left. `clauderipple picker reapply` (the GUI's re-apply action)
+  replaces the app's own choice on request and remembers it for `picker off`;
+  like repair it refuses with the router down or the CA untrusted, and it
+  refuses another installation's entry and a hybrid configuration. The status
+  route names this as `picker.entry = { state, holder, reapply }`, and the GUI
+  offers the action only where `reapply` is true and `picker-ca` is not
+  reported. Readiness says which fix works: `picker-proxy` (nothing in effect
+  names this router) or `picker-restart` (our entry changed after the router
+  started and no claude.ai request has come through since: the app has not
+  started with it). A router restart forgets what it saw, so an entry older than
+  the process is not reported either way.
 
 ### 3a. The status mod (packages/mod)
 
@@ -1857,7 +1944,9 @@ tight, and nothing at 100 or more.
   (200 or 503 + `retry-after: 5`) list what stands between a request and a
   model: `settings` (Claude Code not pointed at us), `upstream` (consecutive
   connect failures), `picker-ca` / `picker-proxy` (picker mode without trust or
-  the app proxy entry), `provider:<name>` (TCP unreachable). The tray shows the
+  without an applied entry that names this router: re-apply) / `picker-restart`
+  (our entry is new and the app has not started with it: restart Claude
+  Desktop), `provider:<name>` (TCP unreachable). The tray shows the
   list in its detail line. A router that answers is alive; only an empty list
   means it is ready.
 - **OAuth wire behavior (behavioral-spec evidence; not documented public API
@@ -2635,6 +2724,7 @@ plan unless marked otherwise.
 | The DeepSeek `401` stayed unexplained for a day: a provider error was logged as a status code only (2026-09-15) | Upstream 4xx/5xx bodies are logged (first 300 characters, key-shaped strings masked) and kept in the request record. This is the same rule already required of the translator above. |
 | "Connect Claude subscription" from the tray/GUI failed with "setup-token failed": `claude setup-token` is an interactive terminal flow and neither place has a terminal (2026-09-15, Windows) | Without a TTY the error says to run `clauderipple claude-login` in a terminal and that an existing Claude Code login is reused anyway; other failures carry what `claude` printed. A button that cannot work where it is must say where it works. |
 | Closing Claude Desktop's window does not quit it; reopening hits `Not main instance, returning early` and the app silently keeps the OLD proxy setting. The user sees "I configured it and nothing happened" with no error anywhere (2026-09-14) | Tell the user that closing the window is not enough, and detect it: with picker mode on, the router knows whether the app is actually routing through it. Surface "configured, but the app has not restarted yet" rather than letting it fail silently. |
+| Picker mode on, and a disk cleanup deleted `%LOCALAPPDATA%\Claude-3p` (it looked like an old VM cache) with its `_meta.json` and our entry. At its next start Desktop logged `proxy for https://claude.ai resolved (direct)` and the picker lost every routed model. Readiness said `picker-proxy`, whose advice was "restart Claude Desktop", which could not help; `repair` skipped a missing entry (it only rewrote ours on an old port), and the GUI's only control was the switch, whose click runs `picker off` and removes the CA with a second Windows dialog. Only `clauderipple picker on` fixed it (Windows 11, 2026-11-19/20). The same unexplained loss on macOS, 2026-10-25 (`_meta.json` reset to `{}`) | A readiness code names the fix that works: `picker-proxy` = re-apply (missing, another app's or installation's choice, an old port), `picker-restart` = restart (our new entry not yet used). With picker mode on, the router answering and `direct on` not holding it, `repair` applies the entry again by itself while nothing is applied, re-checked under the meta lock and never over an untrusted CA; anything someone else applied is reported, never replaced. The GUI and CLI have a re-apply action (`picker reapply`) that touches only the entry, offered only where it would act (not for another installation's entry, a hybrid configuration, `direct on` or an untrusted CA). Our meta keeps Desktop's `entries` list (§3). Tests: `picker-entry-recovery.test.ts`, `picker-readiness.test.ts`, `ui-picker-reapply.test.ts`, `tray-status.test.ts`. |
 | A subagent prompt carried `[[ripple: deepseek@high]]` while `aliases` had no `deepseek`; the marker resolved to a model id nobody declared, `resolve()` returned null, and the request went to Anthropic as an ordinary `PASS` — 30 × `404 model: deepseek-v4.1-flash` over two days, read by the session as "the model stopped working" (2026-09-19/20) | A non-`claude-*` model this router cannot route is **refused here, by name**: `400 invalid_request_error "ClaudeRipple: <reason>"`, tag `REFUSE`, reason in the request record (`decide()`'s `refusal`: undeclared / declared by two providers / ingress-only owner / unknown marker alias / alias to an undeclared model). Native `claude-*` ids keep passing through untouched — Claude traffic is never hijacked to say no. And the marker alias table is derived from the agent files themselves (§4), so an agent that exists is an alias that resolves. |
 | A rejected Claude account remained quarantined after its access/refresh token was replaced, because runtime health used the durable account id; keying affinity on that same generation id would instead move a healthy conversation after every refresh (found during multi-account implementation, 2026-09-20) | Runtime health keys on `<local-owner>:<token-generation-digest>`, while conversation affinity and admin state key on the durable local owner. A refresh or re-login receives fresh health without losing its prompt-cache claim; compare-and-swap prevents an old rejection from marking the new generation. **Refined 2026-11-07:** a *rest* — a 429 cooldown, its failure count and a quota scope — is keyed by the durable account (`ownerId`), so a token refresh during a 5h/7d window rest does not hand back a fresh credential with no cooldown; only the quarantine stays with the token generation. Every generation of the app's own login is named `current`, so that login states its account explicitly (`healthKey`): Claude Code's local `oauthAccount.accountUuid` (or organization id), hashed and never stored or logged; a token refresh keeps it and switching the app's login changes it, so the old account's rest is left behind. When that identity is unreadable the runtime generation is used, so a refresh may revive a rest but a different login never inherits one. |
 | The worker registry was four places that did not know each other — `providers.*.models`, `aliases`, `~/.claude/agents/*.md`, and prose in CLAUDE.md — and every new provider needed all four edited by hand; the one left out was the one that failed (2026-09-19, DeepSeek) | One source: a ticked model *is* a worker. Agent files and marker aliases are generated from `config.json` (§4 "worker definitions"); nothing about a worker is written twice. |

@@ -12,7 +12,7 @@ import path from "node:path";
 import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
 import { certPaths } from "./certs.ts";
 import { claudeBinary, claudeCodeLogin, claudeLoginHint, type ClaudeCodeLogin } from "./claude-auth.ts";
-import { applyAppProxy, currentAppProxy } from "./picker.ts";
+import { applyAppProxy, appProxyState, caTrusted, currentAppProxy, restoreMissingAppProxy, type AppProxyState } from "./picker.ts";
 import { applyProxyEnv, settingsEnv } from "./settings.ts";
 import type { AgentState } from "./supervisor.ts";
 import type { SupervisorOps, SupervisorView } from "./registration.ts";
@@ -50,6 +50,8 @@ export type RecoveryDeps = {
   remoteHostInstalled?: () => boolean | Promise<boolean>;
   /** Whether the Claude Code CLI itself has a login (the phone host's sessions need one). */
   claudeLogin?: () => Promise<ClaudeCodeLogin>;
+  /** Whether the system trusts our CA; asked only before repair would point Claude Desktop at the router. */
+  caTrusted?: (caPem: string) => boolean;
 };
 
 export async function fetchRouterStatus(adminUrl: string, timeoutMs: number): Promise<RouterStatus | null> {
@@ -111,7 +113,25 @@ type Snapshot = {
   caPath: string;
   cliStale: boolean;
   desktopStale: boolean;
+  /** Picker mode is on, `direct on` is not, and Claude Desktop has nothing of ours applied (appProxyState "missing"). */
+  desktopMissing: boolean;
 };
+
+/**
+ * The Desktop side of a doctor report, from what the app will read. Desktop reads nothing when
+ * nothing is applied, when a hybrid pointer stands in for the entry, or when _meta.json or the
+ * applied entry cannot be read (Desktop 6.6395, `_5()`/`wpe()` in index.pre.js return nothing on a
+ * read error), so those are "none": it goes direct; an unreadable file used to make doctor and
+ * repair throw. `stale` (repair rewrites it) is this installation's own entry only: another
+ * installation's on another port is that installation's proxy, which repair could never rewrite.
+ */
+function desktopSide(entry: AppProxyState, proxyUrl: string): { proxy: ProxyState; url: string | null; stale: boolean } {
+  const url = entry.egressProxyUrl;
+  if (entry.state === "applied") return { proxy: "ripple", url, stale: false };
+  if (entry.state === "stale") return { proxy: url ? "other" : "none", url, stale: true };
+  if (entry.state === "other" && url) return { proxy: url === proxyUrl ? "ripple" : "other", url, stale: false };
+  return { proxy: "none", url: null, stale: false };
+}
 
 function configFile(home: string): string {
   return path.join(home, "config.json");
@@ -141,8 +161,11 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   const status = await (deps.routerStatus ?? fetchRouterStatus)(adminUrl, 4_000);
   const view = deps.supervisor.inspect();
   const cli = cliProxyState(settingsEnv(), proxyUrl, caPath);
-  const desktop = desktopProxyState(currentAppProxy(), proxyUrl);
+  const entry = appProxyState(proxyUrl, deps.home);
+  const desktop = desktopSide(entry, proxyUrl);
   const pickerEnabled = cfg.picker?.enabled === true;
+  // `direct on` takes our entry off on purpose and keeps it in direct.json for `direct off`.
+  const directOn = fs.existsSync(path.join(deps.home, "direct.json"));
   const mode = classifyMode(cli.proxy, desktop.proxy, pickerEnabled);
 
   const problems: Problem[] = [];
@@ -167,8 +190,27 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   }
   if (cli.stale) add("cli-port-mismatch", `Claude Code is set to a ClaudeRipple port that is no longer used (${cli.url}; the router listens on ${proxyUrl}).`);
   else if (cli.proxy === "other") add("cli-foreign-proxy", `Claude Code goes through another proxy (${cli.url}), not ClaudeRipple.`);
-  if (desktop.stale) add("desktop-port-mismatch", `Claude Desktop is set to a ClaudeRipple port that is no longer used (${desktop.url}; the router listens on ${proxyUrl}).`);
+  // Our entry on an old port leaves the app on a dead or wrong router, so repair rewrites it. Our
+  // entry naming no proxy leaves the app direct and working, as a missing one does: it is not a
+  // port to move but an entry to apply again, under the same guards (picker mode, router, CA).
+  const desktopNoProxy = desktop.stale && desktop.url === null;
+  const desktopStale = desktop.stale && !desktopNoProxy;
+  if (desktopStale) add("desktop-port-mismatch", `Claude Desktop is set to a ClaudeRipple port that is no longer used (${desktop.url}; the router listens on ${proxyUrl}).`);
   else if (desktop.proxy === "other") add("desktop-foreign-proxy", `Claude Desktop goes through another proxy (${desktop.url}), not ClaudeRipple.`);
+  // Picker mode on and nothing of ours applied: Desktop goes direct and its picker lists no routed
+  // model, and restarting it changes nothing (2026-11-19, a deleted Claude-3p folder).
+  const desktopMissing = pickerEnabled && !directOn && (entry.state === "missing" || desktopNoProxy);
+  if (desktopMissing) {
+    add("desktop-entry-missing", `Picker mode is on, but Claude Desktop ${desktopNoProxy ? "has a ClaudeRipple entry that names no proxy" : `has no ClaudeRipple entry to read (${entry.reason})`}, so it goes direct and its picker shows no routed models. Repair applies it again once the router answers and the ClaudeRipple CA is trusted (\`clauderipple picker on\` trusts it); then quit and reopen Claude Desktop.`);
+  } else if (pickerEnabled && !directOn && entry.state === "other" && desktop.proxy === "none") {
+    // Advise only what works: `picker reapply` replaces the app's own choice, and refuses the others.
+    add("desktop-entry-other",
+      entry.holder === "hybrid" ? `Picker mode is on, but Claude Desktop applies a hybrid configuration, which it reads instead of any entry, so ClaudeRipple's cannot take effect. It is left as it is: end it in Claude Desktop, or turn picker mode off.`
+      : entry.holder === "installation" ? `Picker mode is on, but Claude Desktop's Config Library holds another ClaudeRipple installation's entry (${entry.reason}). It is left as it is: turn picker mode off in that installation, or remove its entry in Claude Desktop.`
+      : `Picker mode is on, but Claude Desktop applies another configuration (${entry.reason}). Repair leaves it as it is; \`clauderipple picker reapply\` applies ClaudeRipple's instead (\`picker off\` restores the current one).`);
+  } else if (pickerEnabled && !directOn && entry.state === "unknown") {
+    add("desktop-entry-unreadable", `Picker mode is on, but Claude Desktop's Config Library cannot be read (${entry.reason}). It was left untouched.`);
+  }
   if (mode === "mixed") add("mixed-mode", `Claude Code ${cli.proxy === "ripple" ? "goes" : "does not go"} through ClaudeRipple, Claude Desktop ${desktop.proxy === "ripple" ? "does" : "does not"}.`);
   // The phone host starts Claude Code through the Agent SDK and passes no credential of its own, so
   // without a login of the CLI's own every turn fails at once (issue #71).
@@ -191,7 +233,8 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
     view,
     caPath,
     cliStale: cli.stale,
-    desktopStale: desktop.stale,
+    desktopStale,
+    desktopMissing,
   };
 }
 
@@ -201,9 +244,10 @@ export async function doctor(deps: RecoveryDeps): Promise<DoctorReport> {
 
 /**
  * Fixes what doctor finds, in order, and is safe to run again: re-register the supervisor for this
- * installation, start it, wait for it to answer, and correct a Claude proxy setting that is ours but
- * names an old port. It never switches between Ripple and direct mode (that is `direct on|off`) and
- * never touches a proxy setting that is not ours.
+ * installation, start it, wait for it to answer, correct a Claude proxy setting that is ours but
+ * names an old port, and, in picker mode with a router that answers, apply Claude Desktop's entry
+ * again when nothing is applied at all. It never switches between Ripple and direct mode (that is
+ * `direct on|off`) and never touches a proxy setting or Config Library entry that is not ours.
  */
 export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
   const sleep = deps.sleep ?? sleepDefault;
@@ -308,6 +352,28 @@ export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
       steps.push({ name: "desktop-proxy", ok: true, detail: `Claude Desktop now points at ${proxyUrl} (quit and reopen it to apply)` });
     } catch (e) {
       steps.push({ name: "desktop-proxy", ok: false, detail: (e as Error).message });
+    }
+  } else if (before.desktopMissing) {
+    // In picker mode every byte the app sends goes through the router (ARCHITECTURE §5): an entry
+    // pointing at one that does not answer would turn a working, direct Desktop into a blank page.
+    const routerUp = responding || steps.some((s) => s.name === "health" && s.ok);
+    if (!routerUp) {
+      steps.push({ name: "desktop-proxy", ok: false, detail: "Claude Desktop's ClaudeRipple entry is missing; not applied again while the router does not answer, since the app could not connect through it" });
+    } else if (!(deps.caTrusted ?? caTrusted)(before.caPath)) {
+      // Picker mode terminates claude.ai with a leaf from our CA: over an untrusted CA every page
+      // fails ERR_CERT_AUTHORITY_INVALID (ARCHITECTURE §5, new Mac 2026-10-06). Desktop going direct
+      // is the working state, so it stays; `picker on` asks the system to trust the CA first.
+      steps.push({ name: "desktop-proxy", ok: false, detail: "Claude Desktop's ClaudeRipple entry is missing; not applied again because the ClaudeRipple CA is not trusted, and the app could not load claude.ai through it. Run `clauderipple picker on`, which asks the system to trust it" });
+    } else {
+      try {
+        // Only while it is still missing: whatever was applied in the meantime is not replaced.
+        const restored = restoreMissingAppProxy(proxyUrl, deps.home);
+        steps.push(restored
+          ? { name: "desktop-proxy", ok: true, detail: `Claude Desktop's ClaudeRipple entry was missing; applied it again (${restored.id}, ${proxyUrl}). Quit and reopen Claude Desktop to use it` }
+          : { name: "desktop-proxy", ok: true, detail: "left as it is: Claude Desktop's Config Library changed while repairing, and what it applies now is not replaced" });
+      } catch (e) {
+        steps.push({ name: "desktop-proxy", ok: false, detail: (e as Error).message });
+      }
     }
   }
 

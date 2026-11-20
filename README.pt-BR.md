@@ -522,7 +522,7 @@ node packages/cli/src/index.ts ui        # open the local GUI in your browser
 
 `uninstall` desfaz tudo e restaura `~/.claude/settings.json` a partir de um backup.
 Outros comandos: `status`, `start`, `stop`, `restart`, `logs -f`, `login`, `logout`,
-`claude-login`, `claude-logout`, `picker on|off`, `agent-title on|off`, `mod on|off`,
+`claude-login`, `claude-logout`, `picker on|off|reapply`, `agent-title on|off`, `mod on|off`,
 `codex on|off`, `update`, `image "<prompt>"`.
 </details>
 

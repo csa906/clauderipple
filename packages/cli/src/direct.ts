@@ -17,7 +17,7 @@ import { classifyMode, cliProxyState, desktopProxyState, fetchRouterStatus, prox
 import { writeJsonAtomic } from "../../router/src/locked-file.ts";
 import { claimedElsewhere, claimsOf, readOwners } from "./owners.ts";
 import type { DesktopServiceDeps } from "./desktop-service.ts";
-import { applyAppProxy, appProxyOwner, currentAppProxy, migrateLegacyAppProxy, removeAppProxy } from "./picker.ts";
+import { applyAppProxy, appProxyOwner, appProxyState, currentAppProxy, migrateLegacyAppProxy, removeAppProxy } from "./picker.ts";
 import { MODEL_SLOT_ENV, editSettingsEnv, isNativeClaudeModel, settingsEnv, settingsPath } from "./settings.ts";
 
 export type DirectResult = { ok: boolean; mode: Mode; restartClaude: true; detail: string };
@@ -193,6 +193,7 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
 
   const restoredKeys: string[] = [];
   let desktopApplied = false;
+  let desktopSkipped = false;
   const edit = editSettingsEnv((current) => {
     // Recheck after the asynchronous health/repair boundary, under the shared settings lock.
     if (JSON.stringify(readState(home)) !== JSON.stringify(saved)) throw new Error("direct snapshot changed while waiting; left untouched");
@@ -213,12 +214,33 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
       }
     }
     if (desktopUrl && appProxyOwner(now, home, desktopUrl) !== "ours") {
-      applyAppProxy(desktopUrl, home, now);
-      desktopApplied = true;
+      // Desktop's side is refused while a hybrid configuration or another installation's entry holds
+      // it (applyAppProxy throws, and the throw would also cancel Claude Code's restore here): Claude
+      // Code goes back to ClaudeRipple, and the note says why Desktop did not.
+      // Another installation's applied entry naming the same URL reads as "applied" (one router
+      // answers both), and apply refuses it too.
+      const entry = appProxyState(desktopUrl, home);
+      const held = (entry.state === "other" && (entry.holder === "hybrid" || entry.holder === "installation")) || (now.ours && appProxyOwner(now, home, desktopUrl) === "other");
+      if (held) {
+        desktopSkipped = true;
+        notes.push(`Claude Desktop's ClaudeRipple entry was not put back: ${entry.reason}, which is left as it is. Once that changes, \`clauderipple picker reapply\` applies it.`);
+      } else {
+        try {
+          applyAppProxy(desktopUrl, home, now);
+          desktopApplied = true;
+        } catch (error) {
+          // Whatever else apply refuses (an owner it cannot verify, a list it cannot read) is said,
+          // not thrown: Claude Code's half of the restore does not depend on it.
+          desktopSkipped = true;
+          notes.push(`Claude Desktop's ClaudeRipple entry was not put back: ${(error as Error).message}. \`clauderipple doctor\` says what holds it.`);
+        }
+      }
     }
     return restoredKeys.length > 0;
   }, () => fs.rmSync(directStatePath(home), { force: true }));
   const restored = [...restoredKeys.map((k) => `settings.json env.${k}`), ...(desktopApplied ? ["Claude Desktop's proxy entry"] : [])];
-  const detail = restored.length > 0 ? `Claude goes through ClaudeRipple again. Restored: ${restored.join(", ")}.${edit.backup ? ` settings.json backup: ${edit.backup}.` : ""}` : "Claude already went through ClaudeRipple; nothing to restore.";
+  const detail = restored.length > 0 ? `Claude goes through ClaudeRipple again. Restored: ${restored.join(", ")}.${edit.backup ? ` settings.json backup: ${edit.backup}.` : ""}`
+    : desktopSkipped ? "Nothing else was saved to restore."
+    : "Claude already went through ClaudeRipple; nothing to restore.";
   return { ok: true, mode: currentMode(home), restartClaude: true, detail: [...notes, detail].join(" ") };
 }

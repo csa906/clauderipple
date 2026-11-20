@@ -22,7 +22,7 @@ import { installTrayAgent, removeTrayAgent, trayLoginItemDecision, trayPlistPath
 import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
-import { applyAppProxy, caTrusted, CA_NAME, currentAppProxy, migrateLegacyAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
+import { appliedIsMarked, applyAppProxy, appProxyOwner, appProxyState, caTrusted, CA_NAME, currentAppProxy, migrateLegacyAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
 import { removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
 import { withCommandHelp } from "./help-gate.ts";
 import { runtime } from "./runtime.ts";
@@ -47,20 +47,41 @@ async function pickerOn(): Promise<void> {
   // pointing the app at one that is not answering leaves it a blank page, so check first.
   const ready = await probe({ host: cfg.listen.host, port: cfg.listen.port, caPem, upstream: cfg.upstream });
   if (!ready.ok) throw new Error(`the router is not answering (${ready.detail}); picker mode not enabled. Start it with \`clauderipple start\` and try again.`);
-  console.log("Picker mode makes Claude Desktop's own claude.ai traffic go through ClaudeRipple so the model picker can list your GPT models.");
-  console.log(
-    isWindows
-      ? "Step 1/3: trusting the ClaudeRipple CA for your Windows user account. Windows will show a confirmation dialog with the certificate fingerprint — answer Yes. No administrator rights are needed."
-      : isLinux
-        ? `Step 1/3: trusting the ClaudeRipple CA in your NSS database (${nssDb()}), which Chromium and so Claude Desktop reads. Your user only; no password, no sudo.`
-        : "Step 1/3: trusting the ClaudeRipple CA in your login keychain. macOS will ask for your password (ClaudeRipple never sees it).",
-  );
-  trustCa(caPem);
-  if (!caTrusted(caPem)) throw new Error("CA is not trusted; picker mode not enabled");
-  console.log(isWindows || isLinux ? "✓ CA trusted (current user only)" : "✓ CA trusted (login keychain only)");
+  // What step 2 would refuse (a hybrid configuration, another installation's entry) is refused
+  // before step 1 asks the system to trust the CA: a refusal after it left a trusted CA behind with
+  // picker mode off. Step 2 checks again under the lock.
   const proxyUrl = proxyUrlFor(cfg.listen.port);
+  const held = appProxyState(proxyUrl, home);
+  // Another installation's applied entry naming the same URL reads as "applied" (one router answers both).
+  let foreignApplied = false;
+  try {
+    const cur = currentAppProxy();
+    foreignApplied = cur.ours && appProxyOwner(cur, home) === "other";
+  } catch {
+    /* unreadable: "unknown" below */
+  }
+  if (held.state === "unknown" || foreignApplied || (held.state === "other" && (held.holder === "hybrid" || held.holder === "installation"))) {
+    throw new Error(`${foreignApplied ? "the applied entry belongs to another ClaudeRipple installation" : held.reason}, which ClaudeRipple leaves as it is; picker mode not enabled and the CA left as it was.`);
+  }
+  console.log("Picker mode makes Claude Desktop's own claude.ai traffic go through ClaudeRipple so the model picker can list your GPT models.");
+  // A CA that is already trusted needs no dialog, so none is announced (trustCa skips it too).
+  if (caTrusted(caPem)) {
+    console.log(`Step 1/3: the ClaudeRipple CA is already trusted (${isWindows || isLinux ? "current user only" : "login keychain only"}); nothing to confirm.`);
+  } else {
+    console.log(
+      isWindows
+        ? "Step 1/3: trusting the ClaudeRipple CA for your Windows user account. Windows will show a confirmation dialog with the certificate fingerprint — answer Yes. No administrator rights are needed."
+        : isLinux
+          ? `Step 1/3: trusting the ClaudeRipple CA in your NSS database (${nssDb()}), which Chromium and so Claude Desktop reads. Your user only; no password, no sudo.`
+          : "Step 1/3: trusting the ClaudeRipple CA in your login keychain. macOS will ask for your password (ClaudeRipple never sees it).",
+    );
+    trustCa(caPem);
+    if (!caTrusted(caPem)) throw new Error("CA is not trusted; picker mode not enabled");
+    console.log(isWindows || isLinux ? "✓ CA trusted (current user only)" : "✓ CA trusted (login keychain only)");
+  }
+  console.log("Step 2/3: pointing Claude Desktop at ClaudeRipple (an entry in the app's own Config Library).");
   const r = applyAppProxy(proxyUrl);
-  console.log(`✓ Claude Desktop config library entry applied (${r.id}${r.replaced ? `, previous entry ${r.replaced} remembered` : ""}): egressProxyUrl=${proxyUrl}`);
+  console.log(`✓ Claude Desktop config library entry ${r.changed ? "applied" : "already applied"} (${r.id}${r.replaced ? `, previous entry ${r.replaced} remembered` : ""}): egressProxyUrl=${proxyUrl}`);
   setPickerEnabled(true);
   console.log("✓ picker.enabled = true (the router picks it up live; no restart)");
   console.log("\nStep 3/3 is yours: quit and reopen Claude Desktop. The app reads its proxy setting at start.");
@@ -89,16 +110,53 @@ function describeOwnership(result: "other-installation" | "ownership-unknown" | 
   return "! left it alone: its running instance could not be verified as this installation's (no installation id)";
 }
 
+/**
+ * Step 2 of `picker on` alone: Claude Desktop's Config Library entry, for when it went missing while
+ * picker mode stayed on (its Claude-3p folder was deleted, 2026-11-19). The CA and the picker flag
+ * are left as they are, so there is no trust dialog and no `picker off` first, which would remove
+ * the CA and ask a second time. An entry the app applies instead is replaced and remembered for
+ * `picker off`, as `picker on` does; another installation's entry is refused.
+ */
+async function pickerReapply(): Promise<void> {
+  const home = homeDir();
+  const cfg = new ConfigStore(configPath()).get();
+  if (cfg.picker?.enabled !== true) throw new Error("picker mode is off, so there is no entry to apply again. Turn it on with `clauderipple picker on`.");
+  if (fs.existsSync(path.join(home, "direct.json"))) throw new Error("Claude is on its default connection (`clauderipple direct on`); run `clauderipple direct off` first, which brings back what it saved.");
+  const caPem = certPaths(home).caPem;
+  // The same check as `picker on`: an entry pointing at a router that does not answer leaves the app a blank page.
+  const ready = await probe({ host: cfg.listen.host, port: cfg.listen.port, caPem, upstream: cfg.upstream });
+  if (!ready.ok) throw new Error(`the router is not answering (${ready.detail}); Claude Desktop's entry was not applied. Start it with \`clauderipple start\` and try again.`);
+  // Picker mode serves claude.ai with a leaf from our CA: over an untrusted one every page fails
+  // (ERR_CERT_AUTHORITY_INVALID, ARCHITECTURE §5), so the direct app is the working state.
+  if (!caTrusted(caPem)) throw new Error("the ClaudeRipple CA is not trusted, so Claude Desktop could not load claude.ai through the router; its entry was not applied. Run `clauderipple picker on`, which asks the system to trust it.");
+  const proxyUrl = proxyUrlFor(cfg.listen.port);
+  const r = applyAppProxy(proxyUrl, home);
+  if (!r.changed) {
+    console.log(`✓ Claude Desktop config library entry already applied (${r.id}): egressProxyUrl=${proxyUrl}`);
+    console.log("If the picker still shows no routed models, quit Claude Desktop completely and open it again.");
+    return;
+  }
+  console.log(`✓ Claude Desktop config library entry applied (${r.id}${r.replaced ? `, previous entry ${r.replaced} remembered` : ""}): egressProxyUrl=${proxyUrl}`);
+  console.log("\nQuit Claude Desktop completely and open it again: the app reads its proxy setting at start.");
+}
+
 function pickerOff(): void {
   const home = homeDir();
   // Capture legacy ownership before changing the picker or CA, just as uninstall does.
   const proxyUrl = proxyUrlFor(new ConfigStore(configPath()).get().listen.port);
-  const desktop = currentAppProxy();
-  if (desktop.ours && desktop.installationHome === undefined) {
+  // An applied entry whose file is gone cannot be read, but it is no legacy one to migrate:
+  // removeAppProxy finds this home's by its record and puts the app's selection back.
+  let desktop: ReturnType<typeof currentAppProxy> | null = null;
+  try {
+    desktop = currentAppProxy();
+  } catch {
+    desktop = null;
+  }
+  if (desktop?.ours && desktop.installationHome === undefined) {
     if (!migrateLegacyAppProxy(proxyUrl, home)) throw new Error("Claude Desktop 프록시의 설치 소유권을 확인하지 못해 피커 설정과 CA를 보존했습니다. 이 설치의 서비스를 복구하고 프록시 설정을 확인한 뒤 다시 시도해 주세요.");
   }
   const removed = removeAppProxy(proxyUrl, home);
-  if (currentAppProxy().ours) throw new Error("Claude Desktop 프록시가 제거되었는지 확인하지 못해 피커 설정과 CA를 보존했습니다. 프록시를 설정한 설치와 포트를 확인한 뒤 해당 설치에서 다시 시도해 주세요.");
+  if (appliedIsMarked()) throw new Error("Claude Desktop 프록시가 제거되었는지 확인하지 못해 피커 설정과 CA를 보존했습니다. 프록시를 설정한 설치와 포트를 확인한 뒤 해당 설치에서 다시 시도해 주세요.");
   console.log(removed ? "✓ Claude Desktop config library entry removed (previous entry restored if there was one)" : "✓ no ClaudeRipple config library entry");
   setPickerEnabled(false);
   console.log("✓ picker.enabled = false");
@@ -346,10 +404,16 @@ async function uninstall(): Promise<void> {
   // this installation's to remove only when this home's own definition was the one registered
   // when the uninstall started (B03).
   const serviceWasOurs = serviceOwnership(home).state === "ours";
-  const desktop = currentAppProxy();
+  // An applied entry whose file is gone is no legacy one; the integrations step removes this home's.
+  let desktop: ReturnType<typeof currentAppProxy> | null = null;
+  try {
+    desktop = currentAppProxy();
+  } catch {
+    desktop = null;
+  }
   // Capture ownership while the service and its verified process still exist. The durable home
   // marker remains usable by removeClientIntegrations after the service has been unregistered.
-  if (desktop.ours && desktop.installationHome === undefined && desktop.egressProxyUrl === proxyUrlFor(cfg.listen.port)) {
+  if (desktop?.ours && desktop.installationHome === undefined && desktop.egressProxyUrl === proxyUrlFor(cfg.listen.port)) {
     if (!migrateLegacyAppProxy(proxyUrlFor(cfg.listen.port), home)) throw new Error("Claude Desktop 프록시의 설치 소유권을 확인하지 못해 제거를 중단했습니다. 서비스를 복구한 뒤 다시 시도해 주세요.");
   }
   // The phone host is its own account-wide service and is not inside the router's definition: stop
@@ -475,8 +539,22 @@ async function status(): Promise<void> {
   rows.push(["certs", certsExist(home) ? "present" : "missing"]);
   rows.push(["settings.json", env.HTTPS_PROXY === proxyUrl && env.NODE_EXTRA_CA_CERTS === caPath ? "points at ClaudeRipple" : `HTTPS_PROXY=${env.HTTPS_PROXY ?? "-"} NODE_EXTRA_CA_CERTS=${env.NODE_EXTRA_CA_CERTS ?? "-"}`]);
   rows.push([supervisorName(), agentState()]);
-  const ap = currentAppProxy();
-  rows.push(["picker mode", cfg.picker?.enabled ? `on · CA ${caTrusted(caPath) ? "trusted" : "NOT trusted"} · app proxy ${ap.ours ? ap.egressProxyUrl : "NOT set"}` : `off${ap.ours ? " (app proxy entry still present — run `picker off`)" : ""}`]);
+  // What the app will read, named: "NOT set" alone did not say that a restart cannot fix a missing entry.
+  // Each piece of advice names a command that acts in that state: repair and `picker reapply` both
+  // leave direct mode, another installation's entry and a hybrid configuration alone.
+  const entry = appProxyState(proxyUrl, home);
+  const directOn = fs.existsSync(path.join(home, "direct.json"));
+  const appProxy =
+    entry.state === "applied" ? entry.egressProxyUrl
+    : directOn ? `NOT set (Claude is on its default connection; run \`clauderipple direct off\` first)`
+    : entry.state === "missing" ? `NOT set (${entry.reason}; run \`clauderipple picker reapply\` or \`clauderipple repair\`, then restart Claude Desktop)`
+    : entry.state === "stale" ? `NOT current (${entry.reason}; run \`clauderipple repair\`, then restart Claude Desktop)`
+    : entry.state === "other" && entry.holder === "app" ? `NOT set (${entry.reason}; \`clauderipple picker reapply\` applies ClaudeRipple's instead)`
+    : entry.state === "other" && entry.holder === "hybrid" ? `NOT set (${entry.reason}; left as it is: end it in Claude Desktop)`
+    : entry.state === "other" && entry.holder === "installation" ? `NOT set (${entry.reason}; left as it is: change it in that installation or in Claude Desktop)`
+    : `NOT set (${entry.reason})`;
+  const leftover = entry.state === "applied" || entry.state === "stale";
+  rows.push(["picker mode", cfg.picker?.enabled ? `on · CA ${caTrusted(caPath) ? "trusted" : "NOT trusted"} · app proxy ${appProxy}` : `off${leftover ? " (app proxy entry still present — run `picker off`)" : ""}`]);
   const p = await probe({ host: cfg.listen.host, port: cfg.listen.port, caPem: caPath, upstream: cfg.upstream });
   rows.push(["probe", `${p.ok ? "ok" : "FAIL"}: ${p.detail} (${p.ms}ms)`]);
   for (const [name, p2] of Object.entries(cfg.providers)) {
@@ -748,6 +826,7 @@ function help(): void {
   image "<prompt>" [-o FILE] [--aspect square|landscape|portrait] [--transparent] [--ref FILE ...]
                     generate an image with your ChatGPT subscription and print the file's path
   picker on|off     show your mapped models by name in the Claude Desktop picker (trusts the CA in your login keychain, routes the app through ClaudeRipple)
+  picker reapply    put Claude Desktop's ClaudeRipple entry back when it went missing (no CA prompt; then restart Claude Desktop)
   codex on|off      add/remove ClaudeRipple's local OpenAI provider and selection profile for Codex CLI
   agent-title on|off|status
                     prefix subagent titles with the real model and thinking depth ("Terra·high · …") via a Claude Code hook
@@ -853,7 +932,8 @@ async function dispatchCommand(): Promise<void> {
       const sub = args[1];
       if (sub === "on") await pickerOn();
       else if (sub === "off") pickerOff();
-      else console.log("usage: clauderipple picker on|off");
+      else if (sub === "reapply") await pickerReapply();
+      else console.log("usage: clauderipple picker on|off|reapply");
       break;
     }
     case "codex": {

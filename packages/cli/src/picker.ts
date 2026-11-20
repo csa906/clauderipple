@@ -9,6 +9,8 @@
 //      3. set picker.enabled in config.json
 //      → the user restarts Claude Desktop.
 // off: reverse all three.
+// reapply: step 2 alone, for an entry that went missing while picker mode stayed on (a deleted
+//      Claude-3p folder, 2026-11-19); `repair` does the same by itself while nothing is applied.
 
 import { execFileSync } from "node:child_process";
 import crypto, { X509Certificate } from "node:crypto";
@@ -27,9 +29,11 @@ import { verifiedDesktopService, type DesktopServiceDeps } from "./desktop-servi
 export const CA_NAME = "ClaudeRipple local CA";
 
 function appSupport(): string {
-  // Verified in index.pre.js (AW()): userData + "-3p" regardless of 1P/3P mode. Not the plain "Claude" dir.
-  // Windows keeps userData under LOCALAPPDATA, not APPDATA — confirmed on Windows 11 (2026-09-14),
-  // where the app had already created %LOCALAPPDATA%\Claude-3p and read a configLibrary we put there.
+  // Where the app keeps its Config Library, regardless of 1P/3P mode, and never the plain "Claude"
+  // dir. Read in Desktop 6.6395's index.pre.js (`F6()`, 2026-11-20): on win32 a fixed
+  // %LOCALAPPDATA%\Claude-3p, not userData + "-3p" (confirmed on Windows 11 2026-09-14, where the app
+  // read a configLibrary we put there); elsewhere userData + "-3p". The app's own
+  // CLAUDE_USER_DATA_DIR override (userData itself, no suffix) is not followed here.
   if (process.env.CLAUDE_APP_SUPPORT) return process.env.CLAUDE_APP_SUPPORT;
   if (process.platform === "win32") {
     return path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "Claude-3p");
@@ -349,7 +353,214 @@ export function untrustCa(caPem: string, opts: { sweep?: boolean; platform?: Nod
   }
 }
 
-type Meta = { appliedId?: string; clauderipple?: { ourId?: string; previousAppliedId?: string | null; installationHome?: string } } & Record<string, unknown>;
+// `keptId`: an entry of ours the app also wrote into, left listed by `off` without our proxy; no
+// `ourId`, so it is no record of ownership (nothing removes it, and it blocks no other installation),
+// only where the next apply on this home finds it again.
+type Meta = { appliedId?: string; entries?: unknown; hybridPointer?: unknown; clauderipple?: { ourId?: string; keptId?: string; previousAppliedId?: string | null; installationHome?: string } } & Record<string, unknown>;
+
+/**
+ * The name Claude Desktop's own Config Library editor lists our entry under. Desktop 6.6395 keeps
+ * `{ appliedId, entries: [{ id, name }] }` and its editor calls `entries.map`, `.some` and `.push`
+ * on whatever _meta.json it finds (read in its bundle, 2026-11-20), so a meta without the array
+ * breaks it; ours is listed there beside the app's own.
+ */
+const ENTRY_NAME = "ClaudeRipple";
+/** The only applied ids Desktop reads (`/^[a-f0-9-]{36}$/` in its bundle); `crypto.randomUUID()` gives one. */
+const ENTRY_ID = /^[a-f0-9-]{36}$/;
+
+function entryIdOf(entry: unknown): unknown {
+  return entry && typeof entry === "object" ? (entry as { id?: unknown }).id : undefined;
+}
+
+/** Desktop's list with ours in it, every other item as it was. A list that is not an array is not ours to replace. */
+function listedWith(meta: Meta, id: string): unknown[] {
+  if (meta.entries !== undefined && !Array.isArray(meta.entries)) throw new Error("Desktop proxy metadata has an invalid entries list; left untouched");
+  const entries = (meta.entries ?? []) as unknown[];
+  return entries.some((entry) => entryIdOf(entry) === id) ? entries : [...entries, { id, name: ENTRY_NAME }];
+}
+
+/** Desktop's list without ours. Always an array: a meta without one breaks Desktop's editor. */
+function listedWithout(meta: Meta, id: string): unknown[] {
+  if (meta.entries !== undefined && !Array.isArray(meta.entries)) throw new Error("Desktop proxy metadata has an invalid entries list; left untouched");
+  return ((meta.entries ?? []) as unknown[]).filter((entry) => entryIdOf(entry) !== id);
+}
+
+/** Writes _meta.json only when it changes, so an unchanged state never looks like a new one. */
+function writeMeta(dir: string, before: Meta, next: Meta): boolean {
+  if (fs.existsSync(path.join(dir, "_meta.json")) && JSON.stringify(before) === JSON.stringify(next)) return false;
+  writeJsonAtomic(path.join(dir, "_meta.json"), next);
+  return true;
+}
+
+/** Our entry file as an object, or null when it is absent, unreadable or not an object. */
+function readEntry(file: string): Record<string, unknown> | null {
+  try {
+    const current = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    return current && typeof current === "object" && !Array.isArray(current) ? current as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Writes our entry unless it already names this proxy: its time is how the router tells a new entry
+ * (`appProxyState`). Listed in Desktop's editor, the entry is the app's too: its API-key sign-in
+ * writes its provider keys into the applied entry (`signInWithAnthropicApiKey`, 6.6395), and those
+ * stay. A PAC URL does not: Desktop's launch pin takes `egressProxyPacUrl` over `egressProxyUrl`
+ * (`mme`/`Vwt`), so with one our proxy would never be used.
+ */
+function writeEntry(file: string, proxyUrl: string): boolean {
+  const current = readEntry(file) ?? {};
+  if (current.egressProxyUrl === proxyUrl && !("egressProxyPacUrl" in current)) return false;
+  const rest = Object.fromEntries(Object.entries(current).filter(([key]) => key !== "egressProxyPacUrl"));
+  writeJsonAtomic(file, { ...rest, egressProxyUrl: proxyUrl });
+  return true;
+}
+
+/** Whether our entry file holds anything besides our proxy: something the app or the person wrote. */
+function holdsOthersKeys(file: string): boolean {
+  return Object.keys(readEntry(file) ?? {}).some((key) => key !== "egressProxyUrl");
+}
+
+/**
+ * Takes our proxy out of an entry the app also wrote into (an API-key sign-in), which stays, listed,
+ * so nothing the person set up is lost. An entry holding only our proxy is removed instead.
+ */
+function retireEntry(file: string): void {
+  const rest = Object.fromEntries(Object.entries(readEntry(file) ?? {}).filter(([key]) => key !== "egressProxyUrl"));
+  writeJsonAtomic(file, rest);
+}
+
+/** The hosts Desktop 6.6395 accepts for a hybrid pointer in a packaged build (`Wce`, `Yce` in index.pre.js). */
+const HYBRID_HOSTS = new Set(["api.anthropic.com", "api-staging.anthropic.com", "api.claude.ai", "config.claude.com"]);
+
+/**
+ * Desktop reads `hybridPointer.bootstrapUrl` instead of the applied entry whenever it accepts one
+ * (`Tpe()`/`n4()`/`t4()` in index.pre.js, 6.6395: https, one of its own hosts, no credentials in the
+ * URL): then no entry, ours included, is in effect. One it would not accept changes nothing.
+ */
+function hybridPointer(meta: Meta): boolean {
+  const pointer = meta.hybridPointer as { bootstrapUrl?: unknown } | null | undefined;
+  if (!pointer || typeof pointer !== "object" || typeof pointer.bootstrapUrl !== "string") return false;
+  try {
+    const url = new URL(pointer.bootstrapUrl);
+    return url.protocol === "https:" && url.username === "" && url.password === "" && HYBRID_HOSTS.has(url.host);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether an entry id is in Desktop's list or on disk: an entry Desktop can still show or apply. */
+function entryPresent(meta: Meta, id: string): boolean {
+  if (Array.isArray(meta.entries) && meta.entries.some((entry) => entryIdOf(entry) === id)) return true;
+  return fs.existsSync(path.join(configLibraryDir(), `${id}.json`));
+}
+
+/**
+ * Another installation's record whose entry Desktop still lists or has on disk. The meta holds one
+ * record, so applying ours over it would orphan that entry and leave the other installation's
+ * `picker off` unable to find it (B02). A record whose entry is gone is not kept for anyone.
+ */
+function foreignRecord(meta: Meta, installationHome: string): boolean {
+  const record = meta.clauderipple;
+  if (!record || typeof record.installationHome !== "string" || sameHome(record.installationHome, installationHome)) return false;
+  return typeof record.ourId === "string" && record.ourId !== "" && entryPresent(meta, record.ourId);
+}
+
+/** This installation's record, with a valid id Desktop could read: ours to reuse or remove. */
+function ownRecordId(meta: Meta, installationHome: string): string | null {
+  const record = meta.clauderipple;
+  if (!record || typeof record.installationHome !== "string" || !sameHome(record.installationHome, installationHome)) return null;
+  return typeof record.ourId === "string" && ENTRY_ID.test(record.ourId) ? record.ourId : null;
+}
+
+/** The entry `off` left listed for this home because the app wrote into it, while it is still there. */
+function keptEntryId(meta: Meta, installationHome: string): string | null {
+  const record = meta.clauderipple;
+  if (!record || record.ourId !== undefined || typeof record.installationHome !== "string" || !sameHome(record.installationHome, installationHome)) return null;
+  return typeof record.keptId === "string" && ENTRY_ID.test(record.keptId) && entryPresent(meta, record.keptId) ? record.keptId : null;
+}
+
+/**
+ * This installation's own applied entry whose file is gone (meta still names it, the record says it
+ * is this home's): the one case of an applied id that is ours to write back under the same id.
+ */
+function lostOwnEntry(meta: Meta, installationHome: string): string | null {
+  const id = typeof meta.appliedId === "string" ? meta.appliedId : "";
+  const record = meta.clauderipple;
+  if (!id || record?.ourId !== id || typeof record.installationHome !== "string" || !sameHome(record.installationHome, installationHome)) return null;
+  try {
+    fs.statSync(path.join(configLibraryDir(), `${id}.json`));
+    return null;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? id : null;
+  }
+}
+
+/**
+ * What Claude Desktop will do with its Config Library, seen from this installation:
+ *   applied  our entry is applied and names `proxyUrl`
+ *   missing  nothing is applied (no Config Library, an empty or reset _meta.json), or this
+ *            installation's own applied entry file is gone: the only state repair fills by itself
+ *   stale    our entry is applied but names another URL (an old port)
+ *   other    the app applies a configuration another app, the person or another ClaudeRipple
+ *            installation chose, or a hybrid pointer stands in for every entry: never replaced
+ *            without being asked. `holder` says whose: "app" (the app's own entries, which
+ *            `picker reapply` may replace on request), "installation" or "hybrid" (which it refuses)
+ *   unknown  the files cannot be read; nothing is concluded and nothing is written
+ * Never throws: readiness and doctor ask on every poll. `changedAt` (ms) is the newest of the
+ * applied entry's and _meta.json's times, for telling whether the app has started since.
+ */
+export type AppProxyState = { state: "applied" | "missing" | "stale" | "other" | "unknown"; holder: "app" | "installation" | "hybrid" | null; appliedId: string | null; egressProxyUrl: string | null; changedAt: number | null; reason: string };
+
+/** Whether `picker reapply` (applyAppProxy) would act on this state rather than refuse or change nothing. */
+export function reapplyCanFix(entry: AppProxyState): boolean {
+  return entry.state === "missing" || entry.state === "stale" || (entry.state === "other" && entry.holder === "app");
+}
+
+export function appProxyState(proxyUrl: string, installationHome = homeDir()): AppProxyState {
+  const dir = configLibraryDir();
+  const none = (state: AppProxyState["state"], reason: string, appliedId: string | null = null, holder: AppProxyState["holder"] = null): AppProxyState => ({ state, holder, appliedId, egressProxyUrl: null, changedAt: null, reason });
+  let meta: Meta;
+  try {
+    meta = readMeta();
+  } catch (error) {
+    return none("unknown", `its _meta.json cannot be read: ${(error as Error).message}`);
+  }
+  if (hybridPointer(meta)) return none("other", "the app applies a hybrid configuration, which it reads instead of any entry", null, "hybrid");
+  const record = meta.clauderipple;
+  const otherInstallation = typeof record?.installationHome === "string" && !sameHome(record.installationHome, installationHome);
+  const otherRecord = foreignRecord(meta, installationHome);
+  const id = typeof meta.appliedId === "string" && meta.appliedId !== "" ? meta.appliedId : null;
+  if (!id) {
+    // Another installation's entry is still there: filling the gap would take over its record.
+    if (otherRecord) return none("other", "another ClaudeRipple installation's entry is in the Config Library", null, "installation");
+    return none("missing", fs.existsSync(path.join(dir, "_meta.json")) ? "no entry is applied" : "the Config Library is gone");
+  }
+  if (lostOwnEntry(meta, installationHome)) return none("missing", `the applied entry ${id} is gone`, id);
+  const ours = record?.ourId === id;
+  let entry: unknown;
+  let changedAt: number;
+  try {
+    const file = path.join(dir, `${id}.json`);
+    entry = JSON.parse(fs.readFileSync(file, "utf8"));
+    changedAt = Math.max(fs.statSync(file).mtimeMs, fs.statSync(path.join(dir, "_meta.json")).mtimeMs);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && (!ours || otherInstallation)) {
+      return ours || otherRecord
+        ? none("other", "the applied entry belongs to another ClaudeRipple installation", id, "installation")
+        : none("other", `the applied entry ${id} is not ClaudeRipple's`, id, "app");
+    }
+    return none("unknown", `the applied entry ${id} cannot be read: ${(error as Error).message}`, id);
+  }
+  const egressProxyUrl = entry && typeof entry === "object" && typeof (entry as { egressProxyUrl?: unknown }).egressProxyUrl === "string" ? (entry as { egressProxyUrl: string }).egressProxyUrl : null;
+  const seen = (state: AppProxyState["state"], reason: string, holder: AppProxyState["holder"] = null): AppProxyState => ({ state, holder, appliedId: id, egressProxyUrl, changedAt, reason });
+  // The app's own entry, unless another installation's entry is still listed beside it (applying
+  // ours would take over that installation's record).
+  if (!ours) return otherRecord ? seen("other", "another ClaudeRipple installation's entry is in the Config Library", "installation") : seen("other", `the applied entry ${id} is not ClaudeRipple's`, "app");
+  if (otherInstallation) return seen(egressProxyUrl === proxyUrl ? "applied" : "other", "the applied entry belongs to another ClaudeRipple installation", egressProxyUrl === proxyUrl ? null : "installation");
+  return egressProxyUrl === proxyUrl ? seen("applied", "ClaudeRipple's entry is applied") : seen("stale", `ClaudeRipple's entry names ${egressProxyUrl ?? "no proxy"}`);
+}
 
 function readMeta(): Meta {
   let text: string;
@@ -374,6 +585,10 @@ export function currentAppProxy(): { appliedId: string | null; egressProxyUrl: s
     const entry = JSON.parse(fs.readFileSync(path.join(configLibraryDir(), `${id}.json`), "utf8")) as Record<string, unknown>;
     return { appliedId: id, egressProxyUrl: typeof entry.egressProxyUrl === "string" ? entry.egressProxyUrl : null, ours: meta[ENTRY_MARK]?.ourId === id, installationHome: meta.clauderipple?.installationHome, previousAppliedId: meta.clauderipple?.previousAppliedId };
   } catch (error) {
+    // The app's own entry whose file is gone: Desktop reads it as an empty entry (6.6395 `QIi`
+    // returns {} on ENOENT) and goes direct. A file a record names stays an error: whose it is, and
+    // what `off` restores, are that record's.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && meta[ENTRY_MARK]?.ourId !== id) return { appliedId: id, egressProxyUrl: null, ours: false };
     throw new Error(`Desktop proxy entry ${id} could not be read; left untouched`, { cause: error });
   }
 }
@@ -410,15 +625,46 @@ function migrateLegacyAppProxyLocked(proxyUrl: string, installationHome: string,
   return true;
 }
 
-/** Writes our Config Library entry and applies it. Remembers what was applied before so `off` can restore it. */
-export function applyAppProxy(proxyUrl: string, installationHome = homeDir(), expected?: ReturnType<typeof currentAppProxy>, deps: DesktopServiceDeps = {}): { id: string; replaced: string | null } {
+/**
+ * Writes our Config Library entry and applies it. Remembers what was applied before so `off` can
+ * restore it. `changed` is false when everything already said this: nothing was written.
+ */
+export function applyAppProxy(proxyUrl: string, installationHome = homeDir(), expected?: ReturnType<typeof currentAppProxy>, deps: DesktopServiceDeps = {}): { id: string; replaced: string | null; changed: boolean } {
   return withFileLock(path.join(configLibraryDir(), "_meta.json"), () => applyAppProxyLocked(proxyUrl, installationHome, expected, deps));
 }
 
-function applyAppProxyLocked(proxyUrl: string, installationHome: string, expected: ReturnType<typeof currentAppProxy> | undefined, deps: DesktopServiceDeps): { id: string; replaced: string | null } {
+/**
+ * Repair's self-heal: applies our entry only while the app still reads nothing of ours (checked
+ * again under the lock): `missing`, or our own entry naming no proxy, which leaves the app direct
+ * just the same. Whatever another app, the person or another installation applied in the meantime is
+ * never replaced. Null when that changed.
+ */
+export function restoreMissingAppProxy(proxyUrl: string, installationHome = homeDir()): { id: string; changed: boolean } | null {
+  return withFileLock(path.join(configLibraryDir(), "_meta.json"), () => {
+    const now = appProxyState(proxyUrl, installationHome);
+    if (now.state !== "missing" && !(now.state === "stale" && now.egressProxyUrl === null)) return null;
+    const r = applyAppProxyLocked(proxyUrl, installationHome, undefined, {});
+    return { id: r.id, changed: r.changed };
+  });
+}
+
+function applyAppProxyLocked(proxyUrl: string, installationHome: string, expected: ReturnType<typeof currentAppProxy> | undefined, deps: DesktopServiceDeps): { id: string; replaced: string | null; changed: boolean } {
   const dir = configLibraryDir();
   fs.mkdirSync(dir, { recursive: true });
   const meta = readMeta();
+  // Desktop reads a hybrid pointer instead of any entry, so an entry written under one would never
+  // take effect while we reported it applied. Ending it is the app's (its own apply does), not ours.
+  if (hybridPointer(meta)) throw new Error("Claude Desktop applies a hybrid configuration, which it reads instead of any Config Library entry, so ClaudeRipple's could not take effect; end it in Claude Desktop first. Left untouched");
+  // Our own applied entry whose file was deleted: written back under the same id, so the record
+  // and what `off` restores stay as they were.
+  const lost = lostOwnEntry(meta, installationHome);
+  if (lost) {
+    if (expected) throw new Error("Desktop proxy changed before restoration; left untouched");
+    const entries = ENTRY_ID.test(lost) ? listedWith(meta, lost) : listedWithout(meta, lost);
+    writeJsonAtomic(path.join(dir, `${lost}.json`), { egressProxyUrl: proxyUrl });
+    writeMeta(dir, meta, { ...meta, entries });
+    return { id: lost, replaced: null, changed: true };
+  }
   const cur = currentAppProxy();
   if (expected && JSON.stringify(cur) !== JSON.stringify(expected)) throw new Error("Desktop proxy changed before restoration; left untouched");
   if (cur.ours && cur.appliedId) {
@@ -426,41 +672,149 @@ function applyAppProxyLocked(proxyUrl: string, installationHome: string, expecte
     if (owner === "unknown" && migrateLegacyAppProxyLocked(proxyUrl, installationHome, deps)) owner = "ours";
     if (owner === "other") throw new Error("Desktop proxy ownership is unknown or belongs to another installation; left untouched");
     if (owner === "unknown") throw new Error("Desktop proxy ownership is unknown; left untouched");
-    writeJsonAtomic(path.join(dir, `${cur.appliedId}.json`), { egressProxyUrl: proxyUrl });
+    const current = readMeta();
+    // Desktop reads only UUID-shaped ids: an older version's other id is never listed, where nothing
+    // could find it again (ownRecordId) and a re-apply would list a second "ClaudeRipple".
+    const entries = ENTRY_ID.test(cur.appliedId) ? listedWith(current, cur.appliedId) : listedWithout(current, cur.appliedId);
+    const wrote = writeEntry(path.join(dir, `${cur.appliedId}.json`), proxyUrl);
     // Take over an entry an older version applied without recording a home: from here on its
-    // ownership is evidenced like any other (D3).
-    if (cur.installationHome === undefined || !sameHome(cur.installationHome, installationHome)) {
-      const next: Meta = { ...meta, clauderipple: { ...meta.clauderipple, ourId: cur.appliedId, installationHome: normalizeHome(installationHome) } };
-      writeJsonAtomic(path.join(dir, "_meta.json"), next);
-    }
-    return { id: cur.appliedId, replaced: null };
+    // ownership is evidenced like any other (D3). An older meta also gets Desktop's entries list.
+    const home = current.clauderipple?.installationHome;
+    const next: Meta = home === undefined || !sameHome(home, installationHome)
+      ? { ...current, entries, clauderipple: { ...current.clauderipple, ourId: cur.appliedId, installationHome: normalizeHome(installationHome) } }
+      : { ...current, entries };
+    const metaChanged = writeMeta(dir, current, next);
+    return { id: cur.appliedId, replaced: null, changed: wrote || metaChanged };
   }
-  const id = crypto.randomUUID();
-  // Only recognized keys in the entry: the app warns about and ignores unknown ones. Ownership lives in _meta.
-  writeJsonAtomic(path.join(dir, `${id}.json`), { egressProxyUrl: proxyUrl });
-  const previous = typeof meta.appliedId === "string" ? meta.appliedId : null;
-  const next: Meta = { ...meta, appliedId: id, clauderipple: { ourId: id, previousAppliedId: previous, installationHome: normalizeHome(installationHome) } };
+  // The meta holds one record: another installation's whose entry is still listed or on disk is not
+  // ours to replace, applied or not (its `picker off` would find nothing to remove).
+  if (foreignRecord(meta, installationHome)) throw new Error("Desktop proxy ownership belongs to another installation, whose entry is still in Claude Desktop's list; left untouched");
+  const record = meta.clauderipple;
+  const previous = typeof meta.appliedId === "string" && meta.appliedId !== "" ? meta.appliedId : null;
+  // This home's record still names its entry (a meta the app reset, or the app applying another of
+  // its entries): reuse that id rather than leave a second "ClaudeRipple" in the app's list. What
+  // `off` restores is what is applied now, or, with nothing applied, what the record remembered.
+  // So is the entry `off` left listed because the app wrote into it: the proxy goes back in beside
+  // what the app wrote.
+  const ownId = ownRecordId(meta, installationHome);
+  const reuseId = ownId ?? keptEntryId(meta, installationHome);
+  const id = reuseId ?? crypto.randomUUID();
+  const entries = listedWith(meta, id);
+  // Only recognized keys in the entry: the app warns about and ignores unknown ones. Ownership lives
+  // in _meta. Keys the app wrote into a reused entry stay (writeEntry).
+  writeEntry(path.join(dir, `${id}.json`), proxyUrl);
+  const restore = previous ?? (ownId ? record!.previousAppliedId || null : null);
+  const next: Meta = { ...meta, appliedId: id, entries, clauderipple: { ourId: id, previousAppliedId: restore, installationHome: normalizeHome(installationHome) } };
   writeJsonAtomic(path.join(dir, "_meta.json"), next);
-  return { id, replaced: previous };
+  // Our kept entry the person applied in Desktop is reused, not replaced.
+  return { id, replaced: previous === id ? null : previous, changed: true };
 }
 
-/** With `proxyUrl`, only an entry pointing there goes: another install's entry is not ours to remove. */
+/**
+ * The selection `off` hands back: the remembered one while it still exists (listed, or its file is
+ * there: a meta older than the list, listed again under Desktop's first name). With nothing to hand
+ * back, `kept` (our entry the app wrote into, now without our proxy: what the person was using), else
+ * what Desktop seeds for itself, a new empty "Default" (6.6395 `RU()`): it holds no proxy, so the app
+ * goes direct, and the app's flows that need an applied id still find one (its API-key sign-in
+ * refuses "" in `JIi`; its editor's `listConfigs` needs a string, `VNt`). Never another listed entry:
+ * one the person created or duplicated (a copy of ours names the router this very `off` may be
+ * stopping) but never applied would take effect. Nothing listed at all: no selection, and
+ * writeRemoval removes the meta. Called under the meta lock; it may write that "Default" entry.
+ */
+function restoredSelection(entries: unknown[], previous: string | null, kept: string | null): { appliedId: string | null; entries: unknown[] } {
+  if (previous && entries.some((entry) => entryIdOf(entry) === previous)) return { appliedId: previous, entries };
+  if (previous && fs.existsSync(path.join(configLibraryDir(), `${previous}.json`))) return { appliedId: previous, entries: [...entries, { id: previous, name: "Default" }] };
+  if (kept) return { appliedId: kept, entries };
+  if (entries.length === 0) return { appliedId: null, entries };
+  const seeded = crypto.randomUUID();
+  writeJsonAtomic(path.join(configLibraryDir(), `${seeded}.json`), {});
+  return { appliedId: seeded, entries: [...entries, { id: seeded, name: "Default" }] };
+}
+
+/**
+ * Writes what `off` leaves. Nothing left at all (no entry, no selection, no other key) removes
+ * _meta.json: Desktop seeds its own "Default" for a missing one, while it keeps an empty meta as
+ * it is and its sign-in flows then fail on the missing `appliedId` (6.6395 `RU()`).
+ */
+function writeRemoval(dir: string, next: Meta): void {
+  const empty = (key: string): boolean => (key === "entries" && Array.isArray(next.entries) && next.entries.length === 0) || (key === "appliedId" && next.appliedId === "");
+  const keys = Object.keys(next).filter((key) => !empty(key));
+  if (keys.length === 0) fs.rmSync(path.join(dir, "_meta.json"), { force: true });
+  else writeJsonAtomic(path.join(dir, "_meta.json"), next);
+}
+
+/**
+ * With `proxyUrl`, only an applied entry pointing there goes: another install's entry is not ours to
+ * remove. This home's own entry also goes when the app applies another one (or its applied file is
+ * gone): listed in Desktop's editor it would otherwise stay selectable, pointing at a router that
+ * may no longer run. The record proves it is this home's, so no URL is asked of it.
+ */
 export function removeAppProxy(proxyUrl?: string, installationHome = homeDir()): boolean {
   return withFileLock(path.join(configLibraryDir(), "_meta.json"), () => removeAppProxyLocked(proxyUrl, installationHome));
+}
+
+/**
+ * Whether this home's record names an entry Desktop still lists, has on disk or applies with its
+ * file gone: something of ours that `removeAppProxy(undefined, home)` removes by the record alone,
+ * even where `currentAppProxy` says nothing of ours is applied, or cannot read the applied file.
+ */
+export function ownsListedAppProxy(installationHome = homeDir()): boolean {
+  try {
+    const meta = readMeta();
+    const id = ownRecordId(meta, installationHome);
+    return id !== null && (entryPresent(meta, id) || lostOwnEntry(meta, installationHome) !== null);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the applied id is the one a ClaudeRipple record names, without reading its entry file:
+ * `currentAppProxy().ours` throws when that file is gone. Throws only on an unreadable meta.
+ */
+export function appliedIsMarked(): boolean {
+  const meta = readMeta();
+  const id = typeof meta.appliedId === "string" ? meta.appliedId : "";
+  return id !== "" && meta[ENTRY_MARK]?.ourId === id;
 }
 
 function removeAppProxyLocked(proxyUrl: string | undefined, installationHome: string): boolean {
   const dir = configLibraryDir();
   const meta = readMeta();
-  const cur = currentAppProxy();
-  if (!cur.appliedId || appProxyOwner(cur, installationHome, proxyUrl) !== "ours") return false;
-  if (proxyUrl !== undefined && cur.egressProxyUrl !== proxyUrl) return false;
-  const previous = meta.clauderipple?.previousAppliedId ?? null;
-  const next: Meta = { ...meta };
-  delete next.clauderipple;
-  if (previous) next.appliedId = previous;
-  else delete next.appliedId;
-  writeJsonAtomic(path.join(dir, "_meta.json"), next);
-  fs.rmSync(path.join(dir, `${cur.appliedId}.json`), { force: true });
+  const own = ownRecordId(meta, installationHome);
+  const applied = typeof meta.appliedId === "string" && meta.appliedId !== "" ? meta.appliedId : null;
+  // This home's entry, listed but not applied (the app applies another one): it and the record go,
+  // and the app's selection stays exactly as the app chose it.
+  if (own && applied !== own) {
+    if (!entryPresent(meta, own)) return false;
+    const keep = holdsOthersKeys(path.join(dir, `${own}.json`));
+    const next: Meta = { ...meta, entries: keep ? listedWith(meta, own) : listedWithout(meta, own) };
+    if (keep) next.clauderipple = { keptId: own, installationHome: normalizeHome(installationHome) };
+    else delete next.clauderipple;
+    writeRemoval(dir, next);
+    if (keep) retireEntry(path.join(dir, `${own}.json`));
+    else fs.rmSync(path.join(dir, `${own}.json`), { force: true });
+    return true;
+  }
+  const lost = lostOwnEntry(meta, installationHome);
+  if (!lost) {
+    const cur = currentAppProxy();
+    if (!cur.appliedId || appProxyOwner(cur, installationHome, proxyUrl) !== "ours") return false;
+    if (proxyUrl !== undefined && cur.egressProxyUrl !== proxyUrl) return false;
+  }
+  const id = lost ?? applied!;
+  // Every other entry in Desktop's list stays, and the selection goes back to what it was. Ours
+  // stays listed, without its proxy, when the app wrote into it (retireEntry).
+  const keep = ENTRY_ID.test(id) && holdsOthersKeys(path.join(dir, `${id}.json`));
+  // The remembered entry can be this very one (the person applied our kept entry in Desktop, and the
+  // next apply reused it): handed back only while it stays, never selected and then deleted.
+  const previous = meta.clauderipple?.previousAppliedId || null;
+  const selection = restoredSelection(keep ? listedWith(meta, id) : listedWithout(meta, id), keep || previous !== id ? previous : null, keep ? id : null);
+  const next: Meta = { ...meta, entries: selection.entries, appliedId: selection.appliedId ?? "" };
+  if (keep) next.clauderipple = { keptId: id, installationHome: normalizeHome(installationHome) };
+  else delete next.clauderipple;
+  writeRemoval(dir, next);
+  if (keep) retireEntry(path.join(dir, `${id}.json`));
+  else fs.rmSync(path.join(dir, `${id}.json`), { force: true });
   return true;
 }
